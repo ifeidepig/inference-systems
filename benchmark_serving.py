@@ -56,6 +56,23 @@ def make_prompt(token_id: int, unique_token_id: int, length: int) -> list[int]:
     return [unique_token_id] + [token_id] * (length - 1)
 
 
+def make_prompts(
+    base_token_id: int,
+    length: int,
+    count: int,
+    vocab_size: int,
+    unique_offset: int = 1,
+) -> list[list[int]]:
+    return [
+        make_prompt(
+            base_token_id,
+            (base_token_id + unique_offset + request_index) % vocab_size,
+            length,
+        )
+        for request_index in range(count)
+    ]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=Path, required=True)
@@ -93,18 +110,24 @@ def main() -> None:
     if not candidate_ids:
         raise RuntimeError("tokenizer did not produce a benchmark token")
     base_token_id = candidate_ids[0]
+    vocab_size = llm.tokenizer.vocab_size
     sampling = SamplingParams(
         temperature=0.1,
         max_tokens=args.output_length,
         ignore_eos=True,
     )
 
-    # Warm up kernels before measuring. Keep this request deliberately small.
-    warmup_prompt = make_prompt(
-        base_token_id, base_token_id, min(16, args.prompt_length)
+    # Match measured request shapes so lazy kernel initialization is excluded.
+    # A separate unique-token range prevents prefix-cache hits in the real run.
+    warmup_prompts = make_prompts(
+        base_token_id,
+        args.prompt_length,
+        args.num_requests,
+        vocab_size,
+        unique_offset=args.num_requests + 1024,
     )
     llm.generate(
-        [warmup_prompt],
+        warmup_prompts,
         SamplingParams(temperature=0.1, max_tokens=2, ignore_eos=True),
         use_tqdm=False,
     )
@@ -117,10 +140,10 @@ def main() -> None:
     finished_at: dict[int, float] = {}
 
     benchmark_started = perf_counter()
-    vocab_size = llm.tokenizer.vocab_size
-    for request_index in range(args.num_requests):
-        unique_token_id = (base_token_id + request_index + 1) % vocab_size
-        prompt = make_prompt(base_token_id, unique_token_id, args.prompt_length)
+    prompts = make_prompts(
+        base_token_id, args.prompt_length, args.num_requests, vocab_size
+    )
+    for prompt in prompts:
         submitted = perf_counter()
         llm.add_request(prompt, sampling)
         sequence = llm.scheduler.waiting[-1]

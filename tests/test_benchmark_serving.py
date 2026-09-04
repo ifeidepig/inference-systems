@@ -1,6 +1,6 @@
 import unittest
 
-from benchmark_serving import make_prompt, percentile, summarize
+from benchmark_serving import make_prompt, make_prompts, percentile, summarize
 
 
 class PromptTest(unittest.TestCase):
@@ -11,6 +11,10 @@ class PromptTest(unittest.TestCase):
     def test_prompt_length_must_be_positive(self):
         with self.assertRaises(ValueError):
             make_prompt(7, 11, 0)
+
+    def test_prompt_batch_has_distinct_first_tokens(self):
+        prompts = make_prompts(7, length=3, count=3, vocab_size=100)
+        self.assertEqual(prompts, [[8, 7, 7], [9, 7, 7], [10, 7, 7]])
 
 
 class PercentileTest(unittest.TestCase):
