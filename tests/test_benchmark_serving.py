@@ -1,6 +1,7 @@
 import unittest
 
 from benchmark_serving import make_prompt, make_prompts, percentile, summarize
+from benchmark_interference import token_gaps_ms
 
 
 class PromptTest(unittest.TestCase):
@@ -42,6 +43,14 @@ class SummaryTest(unittest.TestCase):
         self.assertEqual(result["p50"], 2.5)
         self.assertAlmostEqual(result["p95"], 3.85)
         self.assertAlmostEqual(result["p99"], 3.97)
+
+
+class TokenGapTest(unittest.TestCase):
+
+    def test_converts_consecutive_timestamps_to_milliseconds(self):
+        gaps = token_gaps_ms([1.0, 1.01, 1.03])
+        self.assertAlmostEqual(gaps[0], 10.0)
+        self.assertAlmostEqual(gaps[1], 20.0)
 
 
 if __name__ == "__main__":
