@@ -1,7 +1,9 @@
 import unittest
+from pathlib import Path
 
 from benchmark_serving import make_prompt, make_prompts, percentile, summarize
 from benchmark_interference import token_gaps_ms
+from benchmark_matrix import build_command
 
 
 class PromptTest(unittest.TestCase):
@@ -51,6 +53,24 @@ class TokenGapTest(unittest.TestCase):
         gaps = token_gaps_ms([1.0, 1.01, 1.03])
         self.assertAlmostEqual(gaps[0], 10.0)
         self.assertAlmostEqual(gaps[1], 20.0)
+
+
+class MatrixCommandTest(unittest.TestCase):
+
+    def test_builds_one_isolated_benchmark_command(self):
+        command = build_command(
+            model=Path("model"),
+            output=Path("result.json"),
+            policy="decode_first",
+            prompt_length=768,
+            token_budget=256,
+            repetitions=5,
+        )
+        self.assertIn("--scheduling-policy", command)
+        self.assertIn("decode_first", command)
+        self.assertIn("768", command)
+        self.assertIn("256", command)
+        self.assertIn("5", command)
 
 
 if __name__ == "__main__":

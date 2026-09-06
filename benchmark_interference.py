@@ -25,6 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-model-len", type=int, default=1024)
     parser.add_argument("--max-num-batched-tokens", type=int, default=256)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.65)
+    parser.add_argument("--repetitions", type=int, default=1)
     parser.add_argument(
         "--scheduling-policy",
         choices=("prefill_first", "decode_first"),
@@ -39,6 +40,8 @@ def validate_args(args: argparse.Namespace) -> None:
             "--inject-after-tokens must be positive and less than "
             "--decode-output-length"
         )
+    if args.repetitions <= 0:
+        raise ValueError("--repetitions must be positive")
     for prompt_length, output_length in (
         (args.decode_prompt_length, args.decode_output_length),
         (args.prefill_prompt_length, args.prefill_output_length),
@@ -64,58 +67,25 @@ def token_gaps_ms(token_times: list[float]) -> list[float]:
     ]
 
 
-def main() -> None:
-    args = parse_args()
-    validate_args(args)
-
-    llm = LLM(
-        str(args.model),
-        enforce_eager=True,
-        tensor_parallel_size=1,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        max_model_len=args.max_model_len,
-        max_num_batched_tokens=args.max_num_batched_tokens,
-        max_num_seqs=8,
-        scheduling_policy=args.scheduling_policy,
-    )
-    token_ids = llm.tokenizer.encode(" benchmark", add_special_tokens=False)
-    if not token_ids:
-        raise RuntimeError("tokenizer did not produce a benchmark token")
-    base_token_id = token_ids[0]
-    vocab_size = llm.tokenizer.vocab_size
-
-    # Warm both prompt shapes with a separate token range to exclude lazy setup.
-    warmup_decode = make_prompt(
-        base_token_id, (base_token_id + 1001) % vocab_size, args.decode_prompt_length
-    )
-    warmup_prefill = make_prompt(
-        base_token_id, (base_token_id + 1002) % vocab_size, args.prefill_prompt_length
-    )
-    warmup_decode_pair = [
-        make_prompt(
-            base_token_id,
-            (base_token_id + unique_offset) % vocab_size,
-            args.decode_prompt_length,
-        )
-        for unique_offset in (1003, 1004)
-    ]
-    warmup_sampling = SamplingParams(
-        temperature=0.1, max_tokens=2, ignore_eos=True
-    )
-    # Run separately: a joint warmup would only initialize batch-size=2 decode.
-    llm.generate([warmup_decode], warmup_sampling, use_tqdm=False)
-    llm.generate(warmup_decode_pair, warmup_sampling, use_tqdm=False)
-    llm.generate([warmup_prefill], warmup_sampling, use_tqdm=False)
-    torch.cuda.synchronize()
-    torch.cuda.reset_peak_memory_stats()
-
+def run_trial(
+    llm: LLM,
+    args: argparse.Namespace,
+    base_token_id: int,
+    vocab_size: int,
+    unique_offset: int,
+) -> dict:
     decode_prompt = make_prompt(
-        base_token_id, (base_token_id + 1) % vocab_size, args.decode_prompt_length
+        base_token_id,
+        (base_token_id + unique_offset + 1) % vocab_size,
+        args.decode_prompt_length,
     )
     prefill_prompt = make_prompt(
-        base_token_id, (base_token_id + 2) % vocab_size, args.prefill_prompt_length
+        base_token_id,
+        (base_token_id + unique_offset + 2) % vocab_size,
+        args.prefill_prompt_length,
     )
 
+    torch.cuda.reset_peak_memory_stats()
     started_at = perf_counter()
     decode_sequence = add_request(llm, decode_prompt, args.decode_output_length)
     sequences = {decode_sequence.seq_id: decode_sequence}
@@ -205,8 +175,7 @@ def main() -> None:
     interference_gap_ms = (
         first_token_after_injection - last_token_before_injection
     ) * 1000
-    result = {
-        "config": vars(args) | {"model": str(args.model), "output": str(args.output)},
+    return {
         "summary": {
             "duration_s": finished_at - started_at,
             "decode_request_id": decode_sequence.seq_id,
@@ -225,9 +194,76 @@ def main() -> None:
         },
         "trace": trace,
     }
+
+
+def main() -> None:
+    args = parse_args()
+    validate_args(args)
+
+    llm = LLM(
+        str(args.model),
+        enforce_eager=True,
+        tensor_parallel_size=1,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        max_model_len=args.max_model_len,
+        max_num_batched_tokens=args.max_num_batched_tokens,
+        max_num_seqs=8,
+        scheduling_policy=args.scheduling_policy,
+    )
+    token_ids = llm.tokenizer.encode(" benchmark", add_special_tokens=False)
+    if not token_ids:
+        raise RuntimeError("tokenizer did not produce a benchmark token")
+    base_token_id = token_ids[0]
+    vocab_size = llm.tokenizer.vocab_size
+
+    # Warm both prompt shapes with a separate token range to exclude lazy setup.
+    warmup_decode = make_prompt(
+        base_token_id, (base_token_id + 1001) % vocab_size, args.decode_prompt_length
+    )
+    warmup_prefill = make_prompt(
+        base_token_id, (base_token_id + 1002) % vocab_size, args.prefill_prompt_length
+    )
+    warmup_decode_pair = [
+        make_prompt(
+            base_token_id,
+            (base_token_id + unique_offset) % vocab_size,
+            args.decode_prompt_length,
+        )
+        for unique_offset in (1003, 1004)
+    ]
+    warmup_sampling = SamplingParams(
+        temperature=0.1, max_tokens=2, ignore_eos=True
+    )
+    # Run separately: a joint warmup would only initialize batch-size=2 decode.
+    llm.generate([warmup_decode], warmup_sampling, use_tqdm=False)
+    llm.generate(warmup_decode_pair, warmup_sampling, use_tqdm=False)
+    llm.generate([warmup_prefill], warmup_sampling, use_tqdm=False)
+    torch.cuda.synchronize()
+    trials = [
+        run_trial(
+            llm,
+            args,
+            base_token_id,
+            vocab_size,
+            unique_offset=2000 + trial_index * 10,
+        )
+        for trial_index in range(args.repetitions)
+    ]
+    interference_gaps = [
+        trial["summary"]["interference_gap_ms"] for trial in trials
+    ]
+    durations = [trial["summary"]["duration_s"] * 1000 for trial in trials]
+    result = {
+        "config": vars(args) | {"model": str(args.model), "output": str(args.output)},
+        "aggregate": {
+            "interference_gap_ms": summarize(interference_gaps),
+            "duration_ms": summarize(durations),
+        },
+        "trials": trials,
+    }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2), encoding="utf-8")
-    print(json.dumps(result["summary"], indent=2))
+    print(json.dumps(result["aggregate"], indent=2))
     print(f"wrote {args.output}")
 
 
