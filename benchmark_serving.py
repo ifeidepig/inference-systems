@@ -84,6 +84,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-num-batched-tokens", type=int, default=512)
     parser.add_argument("--max-num-seqs", type=int, default=8)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.65)
+    parser.add_argument(
+        "--scheduling-policy",
+        choices=("prefill_first", "decode_first"),
+        default="prefill_first",
+    )
     return parser.parse_args()
 
 
@@ -104,6 +109,7 @@ def main() -> None:
         max_model_len=args.max_model_len,
         max_num_batched_tokens=args.max_num_batched_tokens,
         max_num_seqs=args.max_num_seqs,
+        scheduling_policy=args.scheduling_policy,
     )
 
     candidate_ids = llm.tokenizer.encode(" benchmark", add_special_tokens=False)
@@ -154,16 +160,21 @@ def main() -> None:
     decode_time = 0.0
     prefill_steps = 0
     decode_steps = 0
+    mixed_steps = 0
+    mixed_time = 0.0
     peak_kv_blocks_used = 0
 
     while not llm.is_finished():
         step_started = perf_counter()
-        _, scheduled_tokens = llm.step()
+        _, stats = llm.step()
         torch.cuda.synchronize()
         step_finished = perf_counter()
         step_time = step_finished - step_started
 
-        if scheduled_tokens > 0:
+        if stats.prefill_tokens and stats.decode_tokens:
+            mixed_time += step_time
+            mixed_steps += 1
+        elif stats.prefill_tokens:
             prefill_time += step_time
             prefill_steps += 1
         else:
@@ -210,6 +221,7 @@ def main() -> None:
             "max_num_batched_tokens": args.max_num_batched_tokens,
             "max_num_seqs": args.max_num_seqs,
             "gpu_memory_utilization": args.gpu_memory_utilization,
+            "scheduling_policy": args.scheduling_policy,
             "gpu": torch.cuda.get_device_name(0),
             "torch": torch.__version__,
         },
@@ -228,6 +240,8 @@ def main() -> None:
             "prefill_time_s": prefill_time,
             "decode_steps": decode_steps,
             "decode_time_s": decode_time,
+            "mixed_steps": mixed_steps,
+            "mixed_time_s": mixed_time,
             "ttft_ms": summarize([request.ttft_ms for request in requests]),
             "tpot_ms": summarize([request.tpot_ms for request in requests]),
             "e2e_ms": summarize([request.e2e_ms for request in requests]),

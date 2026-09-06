@@ -25,6 +25,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-model-len", type=int, default=1024)
     parser.add_argument("--max-num-batched-tokens", type=int, default=256)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.65)
+    parser.add_argument(
+        "--scheduling-policy",
+        choices=("prefill_first", "decode_first"),
+        default="prefill_first",
+    )
     return parser.parse_args()
 
 
@@ -71,6 +76,7 @@ def main() -> None:
         max_model_len=args.max_model_len,
         max_num_batched_tokens=args.max_num_batched_tokens,
         max_num_seqs=8,
+        scheduling_policy=args.scheduling_policy,
     )
     token_ids = llm.tokenizer.encode(" benchmark", add_special_tokens=False)
     if not token_ids:
@@ -125,7 +131,7 @@ def main() -> None:
         waiting_before = [sequence.seq_id for sequence in llm.scheduler.waiting]
         running_before = [sequence.seq_id for sequence in llm.scheduler.running]
         step_started = perf_counter()
-        _, scheduled_tokens = llm.step()
+        _, stats = llm.step()
         torch.cuda.synchronize()
         step_finished = perf_counter()
 
@@ -137,11 +143,18 @@ def main() -> None:
                 observed_tokens[request_id] = sequence.num_completion_tokens
                 generated.append({"request_id": request_id, "tokens": new_tokens})
 
+        if stats.prefill_tokens and stats.decode_tokens:
+            phase = "mixed"
+        elif stats.prefill_tokens:
+            phase = "prefill"
+        else:
+            phase = "decode"
         trace.append(
             {
                 "step": step_index,
-                "phase": "prefill" if scheduled_tokens > 0 else "decode",
-                "scheduled_tokens": abs(scheduled_tokens),
+                "phase": phase,
+                "prefill_tokens": stats.prefill_tokens,
+                "decode_tokens": stats.decode_tokens,
                 "duration_ms": (step_finished - step_started) * 1000,
                 "waiting_before": waiting_before,
                 "running_before": running_before,
@@ -165,6 +178,22 @@ def main() -> None:
             observed_tokens[injected_sequence.seq_id] = 0
 
     finished_at = perf_counter()
+    expected_lengths = {
+        decode_sequence.seq_id: args.decode_output_length,
+        injected_sequence.seq_id: args.prefill_output_length,
+    }
+    actual_lengths = {
+        request_id: sequence.num_completion_tokens
+        for request_id, sequence in sequences.items()
+    }
+    if actual_lengths != expected_lengths:
+        raise RuntimeError(
+            f"unexpected completion lengths: {actual_lengths} != {expected_lengths}"
+        )
+    active_kv_blocks = len(llm.scheduler.block_manager.used_block_ids)
+    if active_kv_blocks:
+        raise RuntimeError(f"KV block leak: {active_kv_blocks} blocks remain active")
+
     decode_token_times = token_times[decode_sequence.seq_id]
     decode_gaps = token_gaps_ms(decode_token_times)
     last_token_before_injection = max(
@@ -187,9 +216,11 @@ def main() -> None:
             "decode_max_token_gap_ms": max(decode_gaps),
             "interference_gap_ms": interference_gap_ms,
             "prefill_steps_after_injection": sum(
-                event["phase"] == "prefill"
+                event["phase"] in ("prefill", "mixed")
                 for event in trace[injection_trace_index:]
             ),
+            "completion_lengths": actual_lengths,
+            "active_kv_blocks_after_run": active_kv_blocks,
             "peak_allocated_gib": torch.cuda.max_memory_allocated() / 1024**3,
         },
         "trace": trace,
