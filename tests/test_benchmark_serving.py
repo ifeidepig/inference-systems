@@ -1,9 +1,11 @@
 import unittest
+import asyncio
 from pathlib import Path
 
 from benchmark_serving import make_prompt, make_prompts, percentile, summarize
 from benchmark_interference import token_gaps_ms
 from benchmark_matrix import build_command
+from nanovllm.async_llm import RequestStream, StreamOutput
 
 
 class PromptTest(unittest.TestCase):
@@ -71,6 +73,22 @@ class MatrixCommandTest(unittest.TestCase):
         self.assertIn("768", command)
         self.assertIn("256", command)
         self.assertIn("5", command)
+
+
+class RequestStreamTest(unittest.IsolatedAsyncioTestCase):
+
+    async def test_streams_outputs_until_finished_sentinel(self):
+        queue = asyncio.Queue()
+        stream = RequestStream(request_id=7, queue=queue)
+        queue.put_nowait(StreamOutput(7, 11, (11,), "a", False))
+        queue.put_nowait(StreamOutput(7, 12, (11, 12), "ab", True))
+        queue.put_nowait(None)
+
+        outputs = [output async for output in stream]
+
+        self.assertEqual([output.token_id for output in outputs], [11, 12])
+        self.assertFalse(outputs[0].finished)
+        self.assertTrue(outputs[1].finished)
 
 
 if __name__ == "__main__":
