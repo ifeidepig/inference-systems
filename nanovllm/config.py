@@ -1,6 +1,8 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from transformers import AutoConfig
+
+from nanovllm.models.registry import ModelCapabilities, normalize_hf_config
 
 
 @dataclass(slots=True)
@@ -13,15 +15,141 @@ class Config:
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
     scheduling_policy: str = "prefill_first"
+    scheduler_target_ttft_ms: float = 200.0
+    scheduler_target_tpot_ms: float = 50.0
+    slo_prefill_priority_threshold: float = 0.8
+    slo_min_prefill_tokens: int = 64
+    slo_kv_pressure_threshold: float = 0.9
+    slo_queue_pressure_threshold: int = 3
+    slo_latency_safety_margin_ms: float = 5.0
+    scheduler_ewma_alpha: float = 0.2
+    enable_prefix_cache: bool = True
+    enable_chunked_prefill: bool = True
+    request_metrics_history_size: int = 1024
+    full_hf_config: AutoConfig | None = None
     hf_config: AutoConfig | None = None
+    model_capabilities: ModelCapabilities | None = None
     eos: int = -1
     kvcache_block_size: int = 256
+    prefix_match_unit: int | None = None
     num_kvcache_blocks: int = -1
+    max_num_kvcache_blocks: int | None = None
+    max_num_state_slots: int = 1
+    num_speculative_tokens: int = 0
+    speculative_parallel_verify: bool = True
+    gdn_decode_backend: str = "torch"
+    enable_hybrid_prefix_cache: bool = False
+    hybrid_prefix_checkpoint_interval_blocks: int = 8
+    hybrid_prefix_checkpoint_interval_tokens: int | None = None
+    hybrid_prefix_checkpoint_memory_bytes: int = 0
+    hybrid_prefix_retention_policy: str = "periodic"
+    hybrid_prefix_eviction_policy: str = "lru"
+    enable_hybrid_internal_checkpoints: bool = False
+    hybrid_prefix_checkpoint_bytes_per_slot: int = field(default=0, init=False)
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 256 == 0
+        if self.prefix_match_unit is None:
+            self.prefix_match_unit = self.kvcache_block_size
+        if self.prefix_match_unit <= 0:
+            raise ValueError("prefix_match_unit must be positive")
+        if self.kvcache_block_size % self.prefix_match_unit:
+            raise ValueError(
+                "kvcache_block_size must be divisible by prefix_match_unit"
+            )
         assert 1 <= self.tensor_parallel_size <= 8
-        assert self.scheduling_policy in ("prefill_first", "decode_first")
-        self.hf_config = AutoConfig.from_pretrained(self.model)
+        assert self.scheduling_policy in (
+            "prefill_first",
+            "decode_first",
+            "slo_aware",
+        )
+        assert self.scheduler_target_ttft_ms > 0
+        assert self.scheduler_target_tpot_ms > 0
+        assert self.slo_prefill_priority_threshold > 0
+        assert self.slo_min_prefill_tokens > 0
+        assert 0 < self.slo_kv_pressure_threshold <= 1
+        assert self.slo_queue_pressure_threshold > 0
+        assert self.slo_latency_safety_margin_ms >= 0
+        assert 0 < self.scheduler_ewma_alpha <= 1
+        assert self.request_metrics_history_size >= 0
+        assert (
+            self.max_num_kvcache_blocks is None
+            or self.max_num_kvcache_blocks > 0
+        )
+        assert self.max_num_state_slots > 0
+        assert 0 <= self.num_speculative_tokens <= 8
+        if self.gdn_decode_backend not in ("torch", "cuda", "auto"):
+            raise ValueError("gdn_decode_backend must be torch, cuda, or auto")
+        assert self.hybrid_prefix_checkpoint_interval_blocks > 0
+        if self.hybrid_prefix_checkpoint_interval_tokens is not None:
+            if self.hybrid_prefix_checkpoint_interval_tokens <= 0:
+                raise ValueError("checkpoint token interval must be positive")
+            if (
+                self.hybrid_prefix_checkpoint_interval_tokens
+                % self.prefix_match_unit
+            ):
+                raise ValueError(
+                    "checkpoint token interval must align to prefix_match_unit"
+                )
+        assert self.hybrid_prefix_checkpoint_memory_bytes >= 0
+        if self.hybrid_prefix_retention_policy not in ("periodic", "adaptive"):
+            raise ValueError("unsupported hybrid prefix retention policy")
+        if self.hybrid_prefix_eviction_policy not in ("lru", "cost_aware"):
+            raise ValueError("unsupported hybrid prefix eviction policy")
+        self.full_hf_config = AutoConfig.from_pretrained(self.model)
+        self.hf_config, self.model_capabilities = normalize_hf_config(
+            self.full_hf_config
+        )
+        if self.num_speculative_tokens:
+            if not self.model_capabilities.has_recurrent_state:
+                raise ValueError("native MTP currently requires Qwen3.5 hybrid state")
+            if self.model_capabilities.mtp_num_hidden_layers != 1:
+                raise ValueError("native MTP requires exactly one checkpoint MTP layer")
+        if self.enable_hybrid_prefix_cache:
+            if self.enable_hybrid_internal_checkpoints and self.max_num_seqs != 1:
+                raise ValueError(
+                    "internal hybrid checkpoints currently require max_num_seqs=1"
+                )
+            if not self.enable_prefix_cache:
+                raise ValueError("hybrid prefix cache requires prefix caching enabled")
+            if not self.model_capabilities.has_recurrent_state:
+                raise ValueError("hybrid prefix cache requires recurrent model state")
+            if self.num_speculative_tokens:
+                raise ValueError("hybrid prefix cache MVP does not yet support MTP")
+            if self.hybrid_prefix_checkpoint_memory_bytes <= 0:
+                raise ValueError("hybrid prefix cache requires a positive checkpoint byte budget")
+            num_linear_layers = len(
+                self.model_capabilities.linear_attention_layer_indices
+            )
+            num_key_heads = (
+                self.hf_config.linear_num_key_heads
+                // self.tensor_parallel_size
+            )
+            num_value_heads = (
+                self.hf_config.linear_num_value_heads
+                // self.tensor_parallel_size
+            )
+            key_dim = self.hf_config.linear_key_head_dim
+            value_dim = self.hf_config.linear_value_head_dim
+            conv_dim = 2 * num_key_heads * key_dim + num_value_heads * value_dim
+            self.hybrid_prefix_checkpoint_bytes_per_slot = (
+                num_linear_layers
+                * num_value_heads
+                * key_dim
+                * value_dim
+                * 4
+                + num_linear_layers
+                * conv_dim
+                * (self.hf_config.linear_conv_kernel_dim - 1)
+                * self.hf_config.dtype.itemsize
+            )
+            if (
+                self.hybrid_prefix_checkpoint_memory_bytes
+                < self.hybrid_prefix_checkpoint_bytes_per_slot
+            ):
+                raise ValueError(
+                    "hybrid prefix checkpoint budget is smaller than one "
+                    f"checkpoint ({self.hybrid_prefix_checkpoint_bytes_per_slot} bytes)"
+                )
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)

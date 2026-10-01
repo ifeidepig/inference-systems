@@ -50,6 +50,9 @@ coverage.xml
 .hypothesis/
 .pytest_cache/
 benchmark_results/
+*.nsys-rep
+*.sqlite
+*.ncu-rep
 cover/
 
 # Translations

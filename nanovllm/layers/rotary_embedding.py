@@ -25,7 +25,11 @@ class RotaryEmbedding(nn.Module):
     ) -> None:
         super().__init__()
         self.head_size = head_size
-        assert rotary_dim == head_size
+        if rotary_dim <= 0 or rotary_dim > head_size or rotary_dim % 2:
+            raise ValueError(
+                "rotary_dim must be a positive even number not larger than head_size"
+            )
+        self.rotary_dim = rotary_dim
         inv_freq = 1.0 / (base**(torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
         t = torch.arange(max_position_embeddings, dtype=torch.float)
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
@@ -43,8 +47,14 @@ class RotaryEmbedding(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         cos_sin = self.cos_sin_cache[positions]
         cos, sin = cos_sin.chunk(2, dim=-1)
-        query = apply_rotary_emb(query, cos, sin)
-        key = apply_rotary_emb(key, cos, sin)
+        query_rotated = apply_rotary_emb(query[..., :self.rotary_dim], cos, sin)
+        key_rotated = apply_rotary_emb(key[..., :self.rotary_dim], cos, sin)
+        if self.rotary_dim == self.head_size:
+            query = query_rotated
+            key = key_rotated
+        else:
+            query = torch.cat((query_rotated, query[..., self.rotary_dim:]), dim=-1)
+            key = torch.cat((key_rotated, key[..., self.rotary_dim:]), dim=-1)
         return query, key
 
 

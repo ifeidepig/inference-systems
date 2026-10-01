@@ -28,9 +28,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repetitions", type=int, default=1)
     parser.add_argument(
         "--scheduling-policy",
-        choices=("prefill_first", "decode_first"),
+        choices=("prefill_first", "decode_first", "slo_aware"),
         default="prefill_first",
     )
+    parser.add_argument("--use-cuda-graph", action="store_true")
+    parser.add_argument("--disable-prefix-cache", action="store_true")
+    parser.add_argument("--disable-chunked-prefill", action="store_true")
     return parser.parse_args()
 
 
@@ -50,7 +53,6 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError("prompt and output lengths must be positive")
         if prompt_length + output_length > args.max_model_len:
             raise ValueError("a request exceeds --max-model-len")
-
 
 def add_request(llm: LLM, prompt: list[int], output_length: int):
     llm.add_request(
@@ -74,6 +76,7 @@ def run_trial(
     vocab_size: int,
     unique_offset: int,
 ) -> dict:
+    llm.reset_runtime_metrics()
     decode_prompt = make_prompt(
         base_token_id,
         (base_token_id + unique_offset + 1) % vocab_size,
@@ -192,6 +195,7 @@ def run_trial(
             "active_kv_blocks_after_run": active_kv_blocks,
             "peak_allocated_gib": torch.cuda.max_memory_allocated() / 1024**3,
         },
+        "runtime_metrics": llm.get_runtime_metrics(),
         "trace": trace,
     }
 
@@ -202,13 +206,15 @@ def main() -> None:
 
     llm = LLM(
         str(args.model),
-        enforce_eager=True,
+        enforce_eager=not args.use_cuda_graph,
         tensor_parallel_size=1,
         gpu_memory_utilization=args.gpu_memory_utilization,
         max_model_len=args.max_model_len,
         max_num_batched_tokens=args.max_num_batched_tokens,
         max_num_seqs=8,
         scheduling_policy=args.scheduling_policy,
+        enable_prefix_cache=not args.disable_prefix_cache,
+        enable_chunked_prefill=not args.disable_chunked_prefill,
     )
     token_ids = llm.tokenizer.encode(" benchmark", add_special_tokens=False)
     if not token_ids:

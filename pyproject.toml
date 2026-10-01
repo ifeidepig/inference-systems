@@ -6,10 +6,11 @@ build-backend = "setuptools.build_meta"
 name = "nano-vllm"
 version = "0.2.0"
 authors = [{ name = "Xingkai Yu" }]
+maintainers = [{ name = "ifeidepig" }]
 license = "MIT"
 license-files = ["LICENSE"]
 readme = "README.md"
-description = "a lightweight vLLM implementation built from scratch"
+description = "Qwen3.5 hybrid inference-system extensions built on nano-vLLM"
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "torch>=2.4.0",
@@ -19,8 +20,21 @@ dependencies = [
     "xxhash",
 ]
 
+[project.optional-dependencies]
+serve = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+nanovllm-serve = "nanovllm.server:main"
+
 [project.urls]
-Homepage="https://github.com/GeeeekExplorer/nano-vllm"
+Homepage="https://github.com/ifeidepig/inference-systems"
+Repository="https://github.com/ifeidepig/inference-systems"
 
 [tool.setuptools.packages.find]
 where = ["."]

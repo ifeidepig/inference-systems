@@ -2,10 +2,16 @@ import unittest
 import asyncio
 from pathlib import Path
 
-from benchmark_serving import make_prompt, make_prompts, percentile, summarize
+from benchmark_serving import (
+    aggregate_trials,
+    make_prompt,
+    make_prompts,
+    percentile,
+    summarize,
+)
 from benchmark_interference import token_gaps_ms
 from benchmark_matrix import build_command
-from nanovllm.async_llm import RequestStream, StreamOutput
+from nanovllm.async_llm import RequestStream, StreamOutput, _StreamError
 
 
 class PromptTest(unittest.TestCase):
@@ -45,8 +51,40 @@ class SummaryTest(unittest.TestCase):
         result = summarize([1.0, 2.0, 3.0, 4.0])
         self.assertEqual(result["mean"], 2.5)
         self.assertEqual(result["p50"], 2.5)
+        self.assertAlmostEqual(result["stddev"], 1.118033988749895)
         self.assertAlmostEqual(result["p95"], 3.85)
         self.assertAlmostEqual(result["p99"], 3.97)
+
+    def test_aggregates_trial_and_request_metrics(self):
+        trials = [
+            {
+                "summary": {
+                    "duration_s": duration,
+                    "request_throughput_rps": throughput,
+                    "output_throughput_tokens_per_s": throughput * 10,
+                    "peak_allocated_gib": peak,
+                    "peak_reserved_gib": peak + 1,
+                },
+                "requests": [
+                    {
+                        "ttft_ms": latency,
+                        "tpot_ms": latency + 1,
+                        "e2e_ms": latency + 2,
+                    }
+                ],
+            }
+            for duration, throughput, peak, latency in (
+                (1.0, 2.0, 3.0, 4.0),
+                (3.0, 4.0, 5.0, 6.0),
+            )
+        ]
+
+        result = aggregate_trials(trials)
+
+        self.assertEqual(result["duration_s"]["mean"], 2.0)
+        self.assertEqual(result["request_throughput_rps"]["mean"], 3.0)
+        self.assertEqual(result["peak_allocated_gib"], 5.0)
+        self.assertEqual(result["ttft_ms"]["mean"], 5.0)
 
 
 class TokenGapTest(unittest.TestCase):
@@ -89,6 +127,42 @@ class RequestStreamTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([output.token_id for output in outputs], [11, 12])
         self.assertFalse(outputs[0].finished)
         self.assertTrue(outputs[1].finished)
+
+    async def test_propagates_background_engine_error(self):
+        queue = asyncio.Queue()
+        stream = RequestStream(request_id=7, queue=queue)
+        queue.put_nowait(_StreamError(RuntimeError("model failed")))
+
+        with self.assertRaisesRegex(RuntimeError, "model failed"):
+            await anext(stream)
+
+    async def test_cancel_invokes_engine_callback_once(self):
+        cancelled = []
+
+        async def cancel_callback(request_id):
+            cancelled.append(request_id)
+            return True
+
+        stream = RequestStream(
+            request_id=7,
+            queue=asyncio.Queue(),
+            cancel_callback=cancel_callback,
+        )
+
+        self.assertTrue(await stream.cancel())
+        self.assertFalse(await stream.cancel())
+        self.assertEqual(cancelled, [7])
+
+    async def test_finished_output_ends_stream_without_sentinel(self):
+        queue = asyncio.Queue()
+        stream = RequestStream(request_id=7, queue=queue)
+        queue.put_nowait(StreamOutput(7, 11, (11,), "done", True, "stop"))
+
+        output = await anext(stream)
+
+        self.assertTrue(output.finished)
+        with self.assertRaises(StopAsyncIteration):
+            await anext(stream)
 
 
 if __name__ == "__main__":
