@@ -8,6 +8,7 @@ The repository keeps the upstream Git history and MIT license. The work document
 
 - **Qwen3.5 hybrid runtime**: layer-aware Gated DeltaNet (GDN) and Full Attention execution, request-owned recurrent/conv state slots, strict checkpoint loading, and Hugging Face golden validation.
 - **Fused GDN decode backend**: a CUDA kernel that fuses causal Conv1D state update, SiLU, Q/K normalization, decay/beta, delta-state update, and per-head output.
+- **Shape-aware Tensor Core GEMM**: FP32 CUDA Core tiling plus FP16/BF16 direct/staged WMMA, an equal-contract cuBLAS baseline, LLM-shape benchmarking, and measured cuBLAS fallback.
 - **Fine-Grained Hybrid Prefix Cache**: decouples the 256-token physical KV page from a 16-token match unit, restores aligned GDN checkpoints, and uses partial-page KV copy-on-write (COW).
 - **Native Qwen3.5 MTP**: draft, parallel verification, per-request accept/reject, and KV/GDN state commit or rollback.
 - **Serving and scheduling**: continuous batching, chunked prefill, decode-first/SLO-aware scheduling, streaming, cancellation, request metrics, and OpenAI-compatible HTTP endpoints.
@@ -98,6 +99,25 @@ Selected end-to-end results:
 Nsight Systems recorded 2,169 `cudaLaunchKernel` calls for the Torch microbenchmark and 421 for the fused path, an 80.6% reduction. Nsight Compute hardware counters were unavailable on the local host (`ERR_NVGPUCTRPERM`), so achieved bandwidth and occupancy are intentionally not reported.
 
 See [docs/gdn-decode-kernel.md](docs/gdn-decode-kernel.md) for the complete kernel contract, profiling notes, lifecycle tests, and limitations.
+
+### CUDA Operator Optimization: GEMM and RMSNorm
+
+The standalone GEMM ladder under [`cuda_kernels/gemm`](cuda_kernels/gemm) covers FP32 naive/shared/register tiling and FP16/BF16 Tensor Core WMMA. It compares 22 dtype/shape combinations against a matching FP32-output cuBLAS contract.
+
+Five fresh-process runs identified one stable custom-kernel regime:
+
+| Shape | Direct WMMA vs cuBLAS | Decision |
+| --- | ---: | --- |
+| BF16 `M=16, K=1024, N=6144` QKV | 1.89x-2.02x | direct WMMA |
+| BF16 `M=16, K=1024, N=7168` Gate-Up | 1.71x-1.74x | direct WMMA |
+| FP16 QKV | 0.91x-1.11x | cuBLAS fallback |
+| Larger-M / narrow-N shapes | custom path slower | cuBLAS fallback |
+
+The staged WMMA path is preserved as a negative result. SASS confirms `HMMA.16816.F32` and `HMMA.16816.F32.BF16`; Compute Sanitizer reports zero memory errors and race hazards.
+
+The RMSNorm path under `nanovllm/csrc` implements FP16/BF16 RMSNorm and Fused Add+RMSNorm with PyTorch Custom Op, AOT/JIT extension, current-stream, `torch.compile`, and CUDA Graph support. On the local BF16 H=1024/Rows=32 microbenchmark it reduced latency from 76.4 us to 10.7 us (about 7.1x), while the model-level A/B remained flat because GEMM/Attention dominated the end-to-end runtime.
+
+See [`cuda_kernels/gemm/README.md`](cuda_kernels/gemm/README.md) and [docs/custom-rmsnorm.md](docs/custom-rmsnorm.md) for methodology, results, negative cases, and reproduction commands.
 
 ### Fine-Grained Hybrid Prefix Cache
 
@@ -249,6 +269,7 @@ nanovllm/engine/hybrid_prefix_cache.py
                                     Hybrid prefix coordination
 nanovllm/engine/scheduler.py       Scheduling, admission, preemption
 nanovllm/engine/model_runner.py    CUDA Graph, MTP, COW, capture/restore
+cuda_kernels/gemm/                 FP32/FP16/BF16 GEMM ladder and dispatch
 tests/                             Unit, distributed, and GPU validation
 ```
 
@@ -262,6 +283,7 @@ tests/                             Unit, distributed, and GPU validation
 - GDN prefill remains a correctness-first token scan; a chunkwise prefill backend is future work.
 - Local validation uses the official 0.8B checkpoint. Qwen3.5-9B and real multi-GPU NCCL validation remain pending on an external compute platform.
 - Nsight Compute bandwidth/occupancy metrics require a host with GPU performance-counter permission.
+- The GEMM dispatch is a standalone backend prototype and is not wired into nano-vLLM Linear layers.
 
 ## Upstream and License
 
