@@ -62,9 +62,12 @@ B: KV-only observation -> publish CP@496
 C: restore CP@496 -> generate 1024 tokens
 ```
 
-FP32, BF16, and INT8 generated the same 1024 greedy tokens for C. All formats
-committed a 496-token hit. This is a deterministic regression gate, not a
-general long-context quality result; LongBench/Needle remains pending.
+FP32, BF16, and INT8 generated the same 1024 greedy tokens for C in the initial
+single-prompt gate. A later 5-seed stability study found INT8 occurrence-3
+token divergence in 2/5 seeds at a 256-token prefix; the same seeds were exact
+with FP32 and BF16. The single-prompt result therefore does not establish
+general INT8 quality safety. LongBench/Needle remains pending and INT8 stays
+explicitly opt-in.
 
 The INT8 path also passed the CUDA Graph A/B/C route. Split-checkpoint FP32 and
 INT8 runs matched each other for A, B, and C; comparisons are always made
@@ -115,5 +118,6 @@ python benchmark_adaptive_prefix_promotion.py \
 
 - No CUDA quantization kernel has been implemented yet.
 - No LongBench/Needle score is claimed.
+- INT8 is not token exact across the expanded 5-seed prefix-restore study.
 - Real 9B and NCCL multi-GPU latency remain external-platform work.
 - The public default remains FP32; BF16/INT8 are explicit opt-in choices.

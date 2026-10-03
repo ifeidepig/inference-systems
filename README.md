@@ -154,6 +154,11 @@ native dtype, and dequantizes once on restore. See
 [docs/checkpoint-compression.md](docs/checkpoint-compression.md) for the
 1024-token correctness gate, transaction tests, latency, and limitations.
 
+Expanded stability testing found an important INT8 quality boundary: 2 of 5
+prompt seeds diverged at a 256-token restored prefix, while FP32/BF16 remained
+exact for the same seeds. INT8 therefore remains experimental and is excluded
+from the primary admission-policy performance claims.
+
 Reproduce the three-request promotion lifecycle with:
 
 ```bash

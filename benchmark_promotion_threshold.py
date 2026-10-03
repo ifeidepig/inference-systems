@@ -57,14 +57,20 @@ def build_prompt(
     occurrence: int,
     shared_length: int,
     suffix_length: int,
+    prompt_seed: int = 0,
 ) -> list[int]:
     safe_vocab = min(vocab_size, 200_000)
-    shared_seed = 1009 + prefix_id * 7919
+    shared_seed = 1009 + prompt_seed * 104729 + prefix_id * 7919
     shared = [
         (shared_seed + index * 37) % safe_vocab
         for index in range(shared_length)
     ]
-    suffix_seed = 50021 + prefix_id * 1543 + occurrence * 3571
+    suffix_seed = (
+        50021
+        + prompt_seed * 13007
+        + prefix_id * 1543
+        + occurrence * 3571
+    )
     suffix = [
         (suffix_seed + index * 43) % safe_vocab
         for index in range(suffix_length)
@@ -120,6 +126,7 @@ def run_threshold(args, threshold: int, trace) -> dict:
                 1,
                 args.shared_prefix_length,
                 args.unique_suffix_length,
+                prompt_seed=args.seed,
             )
             engine.generate([warmup_prompt], sampling, use_tqdm=False)
         engine.reset_runtime_metrics()
@@ -133,6 +140,7 @@ def run_threshold(args, threshold: int, trace) -> dict:
                 occurrence,
                 args.shared_prefix_length,
                 args.unique_suffix_length,
+                prompt_seed=args.seed,
             )
             output = engine.generate([prompt], sampling, use_tqdm=False)[0]
             token_ids = output["token_ids"]
