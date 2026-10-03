@@ -477,7 +477,10 @@ HPC-4  DONE: finish/preempt/abort/eviction/fallback/graph and TP transactions
 HPC-5  DONE (single-run gate): official 0.8B equality + normal batched TTFT measured
 HPC-6  DONE: adaptive retention, dense/adaptive/internal and no-share matrix
 HPC-7  DONE: fine-grained partial hits and internal checkpoints
-HPC-8  PENDING: optional CPU tier, ragged internal checkpoints, MTP coexistence
+HPC-8  DONE: demand-driven shared-junction promotion and alignment-loss metrics
+HPC-9  DONE: FP32/BF16/INT8 recurrent-checkpoint storage and drift gates
+HPC-10 DONE: configurable second-sighting admission and frequency study
+HPC-11 PENDING: optional CPU tier, ragged internal checkpoints, MTP coexistence
 ```
 
 Do not begin with a radix tree rewrite. The correctness risk is the aligned

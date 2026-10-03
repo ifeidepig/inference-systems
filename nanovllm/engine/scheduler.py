@@ -6,12 +6,14 @@ from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.block_manager import BlockManager
 from nanovllm.engine.hybrid_prefix_cache import (
+    CheckpointBoundary,
     FullAttentionPrefixManager,
     GDNCheckpointManager,
     HybridCheckpointRetentionPolicy,
     HybridPrefixCoordinator,
     HybridPrefixHit,
     PendingHybridPrefixCapture,
+    PrefixKVCandidate,
 )
 
 
@@ -71,6 +73,9 @@ class Scheduler:
         )
         self.hybrid_prefix_cache = None
         self.hybrid_prefix_coordinator = None
+        self.hybrid_prefix_promotions: dict[
+            int, tuple[CheckpointBoundary, int, PrefixKVCandidate, int]
+        ] = {}
         self.hybrid_prefix_checkpoint_interval_tokens = 0
         if self.enable_hybrid_prefix_cache:
             if prefix_checkpoint_pool is None:
@@ -133,6 +138,23 @@ class Scheduler:
             self.hybrid_prefix_coordinator = HybridPrefixCoordinator(
                 self.full_attention_prefix_manager,
                 self.hybrid_prefix_cache,
+                promote_shared_junctions=(
+                    getattr(
+                        config,
+                        "hybrid_prefix_retention_policy",
+                        "periodic",
+                    )
+                    == "adaptive"
+                ),
+                promotion_min_sightings=getattr(
+                    config,
+                    "hybrid_prefix_promotion_min_sightings",
+                    2,
+                ),
+                demand_capacity=max(
+                    prefix_checkpoint_pool.capacity * 16,
+                    64,
+                ),
             )
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
@@ -268,6 +290,7 @@ class Scheduler:
                 if seq.seq_id != seq_id:
                     continue
                 queue.remove(seq)
+                self._cancel_sequence_promotion(seq)
                 if seq.block_table:
                     self.block_manager.deallocate(seq)
                 if self.state_manager is not None:
@@ -555,7 +578,24 @@ class Scheduler:
                         if hybrid_prefix_hit is not None:
                             self._restore_prefix_state(seq, hybrid_prefix_hit)
                         self.hybrid_prefix_coordinator.commit(plan)
+                        if plan.promotion_candidate is not None:
+                            self.hybrid_prefix_promotions[seq.seq_id] = (
+                                CheckpointBoundary(
+                                    plan.promotion_candidate.boundary_tokens,
+                                    "shared_junction",
+                                ),
+                                plan.promotion_candidate.boundary_tokens
+                                - plan.boundary_tokens,
+                                plan.promotion_candidate,
+                                self.hybrid_prefix_coordinator
+                                .demand_observations(
+                                    plan.promotion_candidate
+                                ),
+                            )
                     except Exception:
+                        self.hybrid_prefix_coordinator.cancel_promotion(
+                            plan.promotion_candidate
+                        )
                         if page_copy is not None:
                             self.block_manager.release_cow_source(page_copy)
                         if seq.state_slot is not None:
@@ -577,10 +617,7 @@ class Scheduler:
                 and not self.enable_hybrid_internal_checkpoints
             ):
                 start = seq.num_cached_tokens
-                retained = self.hybrid_prefix_retention_policy.next_retained_boundary(
-                    start,
-                    seq.num_tokens,
-                )
+                retained = self._next_retained_boundary(seq, start)
                 if retained is not None:
                     distance = retained.boundary_tokens - start
                     if 0 < distance < seq.num_scheduled_tokens:
@@ -632,10 +669,64 @@ class Scheduler:
         seq.mark_preempted()
         seq.status = SequenceStatus.WAITING
         seq.is_prefill = True
+        self._cancel_sequence_promotion(seq)
         self.block_manager.deallocate(seq)
         if self.state_manager is not None:
             self._free_state(seq)
         self.waiting.appendleft(seq)
+
+    def _cancel_sequence_promotion(self, seq: Sequence) -> None:
+        promotion = self.hybrid_prefix_promotions.pop(seq.seq_id, None)
+        if promotion is None or self.hybrid_prefix_coordinator is None:
+            return
+        _, _, candidate, _ = promotion
+        self.hybrid_prefix_coordinator.cancel_promotion(candidate)
+
+    def _pending_promotion(
+        self,
+        seq: Sequence,
+    ) -> tuple[
+        CheckpointBoundary, int, PrefixKVCandidate, int
+    ] | None:
+        return self.hybrid_prefix_promotions.get(seq.seq_id)
+
+    def _next_retained_boundary(
+        self,
+        seq: Sequence,
+        start_tokens: int,
+    ) -> CheckpointBoundary | None:
+        retained = self.hybrid_prefix_retention_policy.next_retained_boundary(
+            start_tokens,
+            seq.num_tokens,
+        )
+        promotion = self._pending_promotion(seq)
+        if promotion is None:
+            return retained
+        promoted_boundary, _, _, _ = promotion
+        if promoted_boundary.boundary_tokens <= start_tokens:
+            return retained
+        if (
+            retained is None
+            or promoted_boundary.boundary_tokens <= retained.boundary_tokens
+        ):
+            return promoted_boundary
+        return retained
+
+    def _classify_capture_boundary(
+        self,
+        seq: Sequence,
+        boundary_tokens: int,
+    ) -> CheckpointBoundary | None:
+        promotion = self._pending_promotion(seq)
+        if (
+            promotion is not None
+            and promotion[0].boundary_tokens == boundary_tokens
+        ):
+            return promotion[0]
+        return self.hybrid_prefix_retention_policy.classify(
+            boundary_tokens,
+            seq.num_tokens,
+        )
 
     def prepare_prefix_captures(
         self,
@@ -651,10 +742,7 @@ class Scheduler:
             if self.enable_hybrid_internal_checkpoints:
                 retained = self._internal_retained_boundaries(seq, end)
             else:
-                item = self.hybrid_prefix_retention_policy.classify(
-                    end,
-                    seq.num_tokens,
-                )
+                item = self._classify_capture_boundary(seq, end)
                 retained = [item] if item is not None else []
             if retained and seq.num_scheduled_tokens > 0:
                 eligible.append(seq)
@@ -671,20 +759,33 @@ class Scheduler:
                 metadata = self.full_attention_prefix_manager.metadata_at_boundary(
                     seq, boundary
                 )
+                capture = PendingHybridPrefixCapture(
+                    prefix_hash=metadata.prefix_hash,
+                    boundary_tokens=boundary,
+                    tail_block_id=metadata.tail_block_id,
+                    state_slot=seq.state_slot,
+                    reason=retained.reason,
+                    internal_state=boundary < step_end,
+                    sequence_id=seq.seq_id,
+                    replay_saved_tokens=(
+                        self.hybrid_prefix_promotions[seq.seq_id][1]
+                        if retained.reason == "shared_junction"
+                        else boundary
+                    ),
+                        demand_count=(
+                            self.hybrid_prefix_promotions[seq.seq_id][3]
+                            if retained.reason == "shared_junction"
+                            else 0
+                        ),
+                )
                 if self.hybrid_prefix_coordinator.contains(
                     metadata.prefix_hash, boundary
                 ):
-                    continue
-                pending.append(
-                    PendingHybridPrefixCapture(
-                        prefix_hash=metadata.prefix_hash,
-                        boundary_tokens=boundary,
-                        tail_block_id=metadata.tail_block_id,
-                        state_slot=seq.state_slot,
-                        reason=retained.reason,
-                        internal_state=boundary < step_end,
+                    self._resolve_pending_promotion(
+                        capture, published=False
                     )
-                )
+                    continue
+                pending.append(capture)
         return pending, True
 
     def _internal_retained_boundaries(
@@ -697,9 +798,38 @@ class Scheduler:
             end_tokens,
             seq.num_tokens,
         )
+        promotion = self._pending_promotion(seq)
+        if promotion is not None:
+            promoted_boundary, _, _, _ = promotion
+            if (
+                seq.num_cached_tokens
+                < promoted_boundary.boundary_tokens
+                <= end_tokens
+            ):
+                retained = [
+                    item
+                    for item in retained
+                    if item.boundary_tokens
+                    != promoted_boundary.boundary_tokens
+                ]
+                retained.append(promoted_boundary)
+                retained.sort(key=lambda item: item.boundary_tokens)
         capacity = self.hybrid_prefix_cache.capacity
         if len(retained) > capacity:
-            retained = retained[-capacity:]
+            if promotion is None:
+                retained = retained[-capacity:]
+            else:
+                promoted_boundary = promotion[0]
+                others = [
+                    item
+                    for item in retained
+                    if item.boundary_tokens
+                    != promoted_boundary.boundary_tokens
+                ]
+                retained = sorted(
+                    others[-max(capacity - 1, 0):] + [promoted_boundary],
+                    key=lambda item: item.boundary_tokens,
+                )
         return retained
 
     def internal_prefix_boundaries(
@@ -730,6 +860,7 @@ class Scheduler:
         if self.hybrid_prefix_coordinator.contains(
             pending.prefix_hash, pending.boundary_tokens
         ):
+            self._resolve_pending_promotion(pending, published=False)
             return False
         evicted = self.hybrid_prefix_coordinator.reserve_capture(pending)
         for entry in evicted:
@@ -744,6 +875,27 @@ class Scheduler:
         checkpoint_slot: int,
     ) -> None:
         self.hybrid_prefix_coordinator.publish(pending, checkpoint_slot)
+        if pending.reason == "shared_junction":
+            self.hybrid_prefix_promotions.pop(pending.sequence_id, None)
+
+    def cancel_prefix_capture(
+        self,
+        pending: PendingHybridPrefixCapture,
+    ) -> None:
+        self._resolve_pending_promotion(pending, published=False)
+
+    def _resolve_pending_promotion(
+        self,
+        pending: PendingHybridPrefixCapture,
+        *,
+        published: bool,
+    ) -> None:
+        if pending.reason != "shared_junction":
+            return
+        self.hybrid_prefix_coordinator.resolve_capture(
+            pending, published=published
+        )
+        self.hybrid_prefix_promotions.pop(pending.sequence_id, None)
 
     def postprocess(
         self,

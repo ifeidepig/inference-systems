@@ -301,6 +301,20 @@ def parse_args() -> argparse.Namespace:
         default=0,
     )
     parser.add_argument(
+        "--hybrid-prefix-checkpoint-dtype",
+        choices=("fp32", "bf16", "int8"),
+        default="fp32",
+    )
+    parser.add_argument(
+        "--hybrid-prefix-promotion-min-sightings",
+        type=int,
+        default=2,
+        help=(
+            "Total prefix sightings required before a KV-only shared "
+            "junction is promoted; must be at least 2."
+        ),
+    )
+    parser.add_argument(
         "--hybrid-prefix-retention-policy",
         choices=("periodic", "adaptive"),
         default="periodic",
@@ -360,6 +374,12 @@ def main() -> None:
         ),
         hybrid_prefix_checkpoint_memory_bytes=(
             args.hybrid_prefix_checkpoint_memory_mib * 1024 * 1024
+        ),
+        hybrid_prefix_checkpoint_dtype=(
+            args.hybrid_prefix_checkpoint_dtype
+        ),
+        hybrid_prefix_promotion_min_sightings=(
+            args.hybrid_prefix_promotion_min_sightings
         ),
         hybrid_prefix_retention_policy=(
             args.hybrid_prefix_retention_policy

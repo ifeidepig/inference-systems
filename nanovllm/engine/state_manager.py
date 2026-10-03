@@ -227,13 +227,60 @@ class HybridStateManager:
 class HybridPrefixCheckpointPool:
     """Fixed-budget immutable copies of aligned Hybrid request states."""
 
+    _SUPPORTED_DTYPES = ("fp32", "bf16", "int8")
+
     def __init__(
         self,
         state_manager: HybridStateManager,
         memory_budget_bytes: int,
+        checkpoint_dtype: str = "fp32",
     ) -> None:
+        if checkpoint_dtype not in self._SUPPORTED_DTYPES:
+            raise ValueError(
+                "checkpoint dtype must be one of "
+                f"{self._SUPPORTED_DTYPES}, got {checkpoint_dtype}"
+            )
         self.state_manager = state_manager
-        self.bytes_per_checkpoint = state_manager.bytes_per_slot()
+        self.checkpoint_dtype = checkpoint_dtype
+        recurrent_shape = state_manager.recurrent_states.shape
+        conv_shape = state_manager.conv_states.shape
+        self.recurrent_shape = (
+            recurrent_shape[0],
+            *recurrent_shape[2:],
+        )
+        self.conv_shape = (conv_shape[0], *conv_shape[2:])
+        recurrent_elements = state_manager.recurrent_states[:, 0].numel()
+        conv_bytes = (
+            state_manager.conv_states[:, 0].numel()
+            * state_manager.conv_states.element_size()
+        )
+        self.scale_shape = None
+        scale_bytes = 0
+        if checkpoint_dtype == "fp32":
+            recurrent_storage_dtype = torch.float32
+            recurrent_bytes = recurrent_elements * 4
+        elif checkpoint_dtype == "bf16":
+            recurrent_storage_dtype = torch.bfloat16
+            recurrent_bytes = recurrent_elements * 2
+        else:
+            recurrent_storage_dtype = torch.int8
+            recurrent_bytes = recurrent_elements
+            # Active recurrent layout is [L, slot, H, K, V]. Quantize over
+            # V so every (layer, head, key-channel) owns one FP32 scale.
+            self.scale_shape = (
+                self.recurrent_shape[0],
+                self.recurrent_shape[1],
+                self.recurrent_shape[2],
+                1,
+            )
+            scale_elements = 1
+            for size in self.scale_shape:
+                scale_elements *= size
+            scale_bytes = scale_elements * 4
+        self.recurrent_bytes_per_checkpoint = recurrent_bytes
+        self.scale_bytes_per_checkpoint = scale_bytes
+        self.conv_bytes_per_checkpoint = conv_bytes
+        self.bytes_per_checkpoint = recurrent_bytes + scale_bytes + conv_bytes
         self.capacity = memory_budget_bytes // self.bytes_per_checkpoint
         if self.capacity <= 0:
             raise ValueError(
@@ -241,19 +288,25 @@ class HybridPrefixCheckpointPool:
                 f"budget={memory_budget_bytes}, "
                 f"required={self.bytes_per_checkpoint}"
             )
-        recurrent_shape = state_manager.recurrent_states.shape
-        conv_shape = state_manager.conv_states.shape
         self.recurrent_checkpoints = torch.zeros(
             self.capacity,
-            recurrent_shape[0],
-            *recurrent_shape[2:],
-            dtype=state_manager.recurrent_states.dtype,
+            *self.recurrent_shape,
+            dtype=recurrent_storage_dtype,
             device=state_manager.recurrent_states.device,
+        )
+        self.recurrent_scales = (
+            torch.zeros(
+                self.capacity,
+                *self.scale_shape,
+                dtype=torch.float32,
+                device=state_manager.recurrent_states.device,
+            )
+            if self.scale_shape is not None
+            else None
         )
         self.conv_checkpoints = torch.zeros(
             self.capacity,
-            conv_shape[0],
-            *conv_shape[2:],
+            *self.conv_shape,
             dtype=state_manager.conv_states.dtype,
             device=state_manager.conv_states.device,
         )
@@ -264,6 +317,44 @@ class HybridPrefixCheckpointPool:
     def can_allocate(self) -> bool:
         return bool(self.free_checkpoint_slots)
 
+    def _store_recurrent(
+        self,
+        checkpoint_slot: int,
+        recurrent_state: torch.Tensor,
+    ) -> None:
+        if self.checkpoint_dtype != "int8":
+            self.recurrent_checkpoints[checkpoint_slot].copy_(recurrent_state)
+            return
+        state_fp32 = recurrent_state.to(torch.float32)
+        amax = state_fp32.abs().amax(dim=-1, keepdim=True)
+        scale = (amax / 127.0).clamp(min=1e-8)
+        quantized = torch.round(state_fp32 / scale).clamp(-127, 127)
+        self.recurrent_checkpoints[checkpoint_slot].copy_(
+            quantized.to(torch.int8)
+        )
+        self.recurrent_scales[checkpoint_slot].copy_(scale)
+
+    def _restore_recurrent(
+        self,
+        checkpoint_slot: int,
+        request_state_slot: int,
+    ) -> None:
+        destination = self.state_manager.recurrent_states[:, request_state_slot]
+        if self.checkpoint_dtype != "int8":
+            destination.copy_(self.recurrent_checkpoints[checkpoint_slot])
+            return
+        restored = (
+            self.recurrent_checkpoints[checkpoint_slot].to(torch.float32)
+            * self.recurrent_scales[checkpoint_slot]
+        )
+        destination.copy_(restored)
+
+    def _zero_checkpoint(self, checkpoint_slot: int) -> None:
+        self.recurrent_checkpoints[checkpoint_slot].zero_()
+        if self.recurrent_scales is not None:
+            self.recurrent_scales[checkpoint_slot].zero_()
+        self.conv_checkpoints[checkpoint_slot].zero_()
+
     def capture(self, request_state_slot: int) -> int:
         if request_state_slot not in self.state_manager.used_slot_ids:
             raise ValueError("cannot checkpoint an unallocated request state slot")
@@ -271,15 +362,15 @@ class HybridPrefixCheckpointPool:
             raise RuntimeError("no free hybrid prefix checkpoint slots")
         checkpoint_slot = self.free_checkpoint_slots.popleft()
         try:
-            self.recurrent_checkpoints[checkpoint_slot].copy_(
+            self._store_recurrent(
+                checkpoint_slot,
                 self.state_manager.recurrent_states[:, request_state_slot]
             )
             self.conv_checkpoints[checkpoint_slot].copy_(
                 self.state_manager.conv_states[:, request_state_slot]
             )
         except Exception:
-            self.recurrent_checkpoints[checkpoint_slot].zero_()
-            self.conv_checkpoints[checkpoint_slot].zero_()
+            self._zero_checkpoint(checkpoint_slot)
             self.free_checkpoint_slots.appendleft(checkpoint_slot)
             raise
         self.used_checkpoint_slots.add(checkpoint_slot)
@@ -290,8 +381,8 @@ class HybridPrefixCheckpointPool:
         recurrent_state: torch.Tensor,
         conv_state: torch.Tensor,
     ) -> int:
-        expected_recurrent = self.recurrent_checkpoints.shape[1:]
-        expected_conv = self.conv_checkpoints.shape[1:]
+        expected_recurrent = self.recurrent_shape
+        expected_conv = self.conv_shape
         if tuple(recurrent_state.shape) != tuple(expected_recurrent):
             raise ValueError(
                 f"internal recurrent checkpoint must have shape {expected_recurrent}"
@@ -304,11 +395,10 @@ class HybridPrefixCheckpointPool:
             raise RuntimeError("no free hybrid prefix checkpoint slots")
         checkpoint_slot = self.free_checkpoint_slots.popleft()
         try:
-            self.recurrent_checkpoints[checkpoint_slot].copy_(recurrent_state)
+            self._store_recurrent(checkpoint_slot, recurrent_state)
             self.conv_checkpoints[checkpoint_slot].copy_(conv_state)
         except Exception:
-            self.recurrent_checkpoints[checkpoint_slot].zero_()
-            self.conv_checkpoints[checkpoint_slot].zero_()
+            self._zero_checkpoint(checkpoint_slot)
             self.free_checkpoint_slots.appendleft(checkpoint_slot)
             raise
         self.used_checkpoint_slots.add(checkpoint_slot)
@@ -319,9 +409,7 @@ class HybridPrefixCheckpointPool:
             raise ValueError("hybrid prefix checkpoint slot is not allocated")
         if request_state_slot not in self.state_manager.used_slot_ids:
             raise ValueError("request state slot is not allocated")
-        self.state_manager.recurrent_states[:, request_state_slot].copy_(
-            self.recurrent_checkpoints[checkpoint_slot]
-        )
+        self._restore_recurrent(checkpoint_slot, request_state_slot)
         self.state_manager.conv_states[:, request_state_slot].copy_(
             self.conv_checkpoints[checkpoint_slot]
         )
@@ -329,8 +417,7 @@ class HybridPrefixCheckpointPool:
     def free(self, checkpoint_slot: int) -> None:
         if checkpoint_slot not in self.used_checkpoint_slots:
             raise ValueError("hybrid prefix checkpoint slot is not allocated")
-        self.recurrent_checkpoints[checkpoint_slot].zero_()
-        self.conv_checkpoints[checkpoint_slot].zero_()
+        self._zero_checkpoint(checkpoint_slot)
         self.used_checkpoint_slots.remove(checkpoint_slot)
         self.free_checkpoint_slots.append(checkpoint_slot)
 
@@ -338,8 +425,7 @@ class HybridPrefixCheckpointPool:
         """Undo an unpublished allocation and restore deterministic order."""
         if checkpoint_slot not in self.used_checkpoint_slots:
             raise ValueError("hybrid prefix checkpoint slot is not allocated")
-        self.recurrent_checkpoints[checkpoint_slot].zero_()
-        self.conv_checkpoints[checkpoint_slot].zero_()
+        self._zero_checkpoint(checkpoint_slot)
         self.used_checkpoint_slots.remove(checkpoint_slot)
         free_slots = [*self.free_checkpoint_slots, checkpoint_slot]
         self.free_checkpoint_slots = deque(sorted(free_slots))
@@ -348,6 +434,12 @@ class HybridPrefixCheckpointPool:
         return (
             self.recurrent_checkpoints.numel()
             * self.recurrent_checkpoints.element_size()
+            + (
+                self.recurrent_scales.numel()
+                * self.recurrent_scales.element_size()
+                if self.recurrent_scales is not None
+                else 0
+            )
             + self.conv_checkpoints.numel()
             * self.conv_checkpoints.element_size()
         )

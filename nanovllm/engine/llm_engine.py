@@ -156,10 +156,10 @@ class LLMEngine:
             )
             try:
                 for pending in pending_captures:
-                    if not self.scheduler.reserve_prefix_capture(pending):
-                        continue
                     checkpoint_slot = None
                     try:
+                        if not self.scheduler.reserve_prefix_capture(pending):
+                            continue
                         checkpoint_slot = self.model_runner.call(
                             "capture_prefix_checkpoint",
                             pending.state_slot,
@@ -177,6 +177,7 @@ class LLMEngine:
                             self.model_runner.call(
                                 "evict_prefix_checkpoint", checkpoint_slot
                             )
+                        self.scheduler.cancel_prefix_capture(pending)
                         raise
             finally:
                 if batch.is_prefill:

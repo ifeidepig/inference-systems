@@ -105,6 +105,11 @@ class ModelRunner:
             self.prefix_checkpoint_pool = HybridPrefixCheckpointPool(
                 self.state_manager,
                 config.hybrid_prefix_checkpoint_memory_bytes,
+                checkpoint_dtype=getattr(
+                    config,
+                    "hybrid_prefix_checkpoint_dtype",
+                    "fp32",
+                ),
             )
         self.enable_hybrid_internal_checkpoints = bool(
             getattr(config, "enable_hybrid_internal_checkpoints", False)
@@ -1009,6 +1014,19 @@ class ModelRunner:
                     ),
                     "hybrid_prefix_checkpoint_bytes_per_slot": (
                         self.prefix_checkpoint_pool.bytes_per_checkpoint
+                    ),
+                    "hybrid_prefix_checkpoint_dtype": (
+                        self.prefix_checkpoint_pool.checkpoint_dtype
+                    ),
+                    "hybrid_prefix_checkpoint_recurrent_bytes_per_slot": (
+                        self.prefix_checkpoint_pool
+                        .recurrent_bytes_per_checkpoint
+                    ),
+                    "hybrid_prefix_checkpoint_scale_bytes_per_slot": (
+                        self.prefix_checkpoint_pool.scale_bytes_per_checkpoint
+                    ),
+                    "hybrid_prefix_checkpoint_conv_bytes_per_slot": (
+                        self.prefix_checkpoint_pool.conv_bytes_per_checkpoint
                     ),
                     "hybrid_prefix_capture_count": self.hybrid_prefix_capture_count,
                     "hybrid_prefix_capture_ms": self.hybrid_prefix_capture_ms,

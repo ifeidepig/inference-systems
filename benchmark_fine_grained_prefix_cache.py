@@ -20,6 +20,11 @@ def main() -> None:
     parser.add_argument("--unique-suffix-length", type=int, default=1)
     parser.add_argument("--output-tokens", type=int, default=8)
     parser.add_argument("--checkpoint-memory-mib", type=int, default=640)
+    parser.add_argument(
+        "--checkpoint-dtype",
+        choices=("fp32", "bf16", "int8"),
+        default="fp32",
+    )
     parser.add_argument("--max-num-batched-tokens", type=int, default=512)
     parser.add_argument("--max-num-kvcache-blocks", type=int, default=64)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
@@ -119,6 +124,7 @@ def main() -> None:
             {
                 "variant": result["variant"],
                 "gdn_decode_backend": result["gdn_decode_backend"],
+                "checkpoint_dtype": result["checkpoint_dtype"],
                 "tokens_match_baseline": result["tokens_match_baseline"],
                 "ttft_ms": result["ttft_ms"],
                 "tpot_ms": result["tpot_ms"],

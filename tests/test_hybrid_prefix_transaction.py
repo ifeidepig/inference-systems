@@ -174,12 +174,102 @@ def _transaction_worker(rank: int, world_size: int, init_file: str) -> None:
         dist.destroy_process_group()
 
 
+def _int8_transaction_worker(rank: int, world_size: int, init_file: str) -> None:
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        manager = HybridStateManager(
+            max_num_seqs=1,
+            num_linear_layers=2,
+            num_value_heads=2,
+            key_head_dim=4,
+            value_head_dim=8,
+            conv_dim=4,
+            conv_kernel_size=4,
+            conv_dtype=torch.bfloat16,
+            device="cpu",
+        )
+        request = SimpleNamespace(state_slot=None)
+        request_slot = manager.allocate(request)
+        torch.manual_seed(100 + rank)
+        original_recurrent = torch.randn_like(
+            manager.recurrent_states[:, request_slot]
+        )
+        original_conv = torch.randn_like(
+            manager.conv_states[:, request_slot]
+        )
+        manager.recurrent_states[:, request_slot].copy_(original_recurrent)
+        manager.conv_states[:, request_slot].copy_(original_conv)
+        pool = HybridPrefixCheckpointPool(
+            manager,
+            memory_budget_bytes=manager.bytes_per_slot(),
+            checkpoint_dtype="int8",
+        )
+
+        checkpoint_slot = transactional_capture_prefix_checkpoint(
+            pool, request_slot
+        )
+        assert checkpoint_slot == 0
+        manager.recurrent_states[:, request_slot].zero_()
+        manager.conv_states[:, request_slot].zero_()
+        transactional_restore_prefix_checkpoint(
+            pool, checkpoint_slot, request_slot
+        )
+        error = (
+            manager.recurrent_states[:, request_slot] - original_recurrent
+        ).abs()
+        assert torch.all(
+            error <= pool.recurrent_scales[checkpoint_slot] / 2 + 1e-6
+        )
+        torch.testing.assert_close(
+            manager.conv_states[:, request_slot],
+            original_conv,
+            rtol=0,
+            atol=0,
+        )
+
+        failing_slot = request_slot if rank == 0 else 99
+        if rank == 0:
+            try:
+                transactional_capture_prefix_checkpoint(pool, failing_slot)
+            except RuntimeError as exc:
+                assert "rolled back" in str(exc)
+            else:
+                raise AssertionError("int8 capture failure did not roll back")
+        else:
+            assert transactional_capture_prefix_checkpoint(
+                pool, failing_slot
+            ) == -1
+        assert pool.used_checkpoint_slots == {checkpoint_slot}
+    finally:
+        dist.destroy_process_group()
+
+
 def test_all_rank_checkpoint_capture_and_restore_transactions():
     handle, init_file = tempfile.mkstemp(prefix="nanovllm-prefix-tx-")
     os.close(handle)
     try:
         mp.spawn(
             _transaction_worker,
+            args=(2, init_file),
+            nprocs=2,
+            join=True,
+        )
+    finally:
+        if os.path.exists(init_file):
+            os.unlink(init_file)
+
+
+def test_all_rank_int8_checkpoint_transaction():
+    handle, init_file = tempfile.mkstemp(prefix="nanovllm-int8-prefix-tx-")
+    os.close(handle)
+    try:
+        mp.spawn(
+            _int8_transaction_worker,
             args=(2, init_file),
             nprocs=2,
             join=True,

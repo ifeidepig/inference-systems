@@ -132,6 +132,37 @@ For a 496-token shared prefix with 256-token physical pages and a 16-token match
 
 The partial-page COW copies 2,949,120 bytes across all Full Attention layers in approximately 0.08-0.10 ms on the local GPU. A forced lifecycle test performed two restores and two COW operations across preemption/re-admission and matched the cold Torch output.
 
+Adaptive retention also promotes demand-discovered shared-prefix junctions. If
+Full-Attention KV matches farther than the available GDN checkpoint, the second
+sighting records the alignment loss and captures the missing recurrent state
+while replaying the required suffix; the third and later requests can then
+restore the joint boundary. Metrics expose KV-only misses, lost alignment
+tokens, and planned/published/cancelled promotions.
+
+The promotion admission threshold is expressed as total prefix sightings and
+defaults to 2. A frequency-aware benchmark covers singleton, pair, triple,
+hot, and Zipf traffic and reports useful-promotion ratio, replay, occupancy,
+and churn. The local policy matrix supports second-sighting as the current
+default while preserving pair-heavy traffic as its documented negative case.
+See [docs/promotion-threshold-study.md](docs/promotion-threshold-study.md).
+
+Cached recurrent checkpoints can independently use FP32, BF16, or symmetric
+INT8 storage while active request state remains FP32. On the official 0.8B
+layout, a fixed 128 MiB budget holds 6/13/24 checkpoints respectively. The
+INT8 path uses per-head/per-key-channel FP32 scales, keeps conv history at its
+native dtype, and dequantizes once on restore. See
+[docs/checkpoint-compression.md](docs/checkpoint-compression.md) for the
+1024-token correctness gate, transaction tests, latency, and limitations.
+
+Reproduce the three-request promotion lifecycle with:
+
+```bash
+python benchmark_adaptive_prefix_promotion.py \
+  --model /path/to/Qwen3.5-0.8B-Base \
+  --shared-prefix-length 496 \
+  --unique-suffix-length 64
+```
+
 See [docs/fine-grained-hybrid-prefix-cache-report.md](docs/fine-grained-hybrid-prefix-cache-report.md).
 
 ### Native MTP
@@ -203,6 +234,8 @@ nanovllm-serve \
   --enable-hybrid-prefix-cache \
   --prefix-match-unit 16 \
   --hybrid-prefix-checkpoint-interval-tokens 4096 \
+  --hybrid-prefix-checkpoint-dtype int8 \
+  --hybrid-prefix-promotion-min-sightings 2 \
   --hybrid-prefix-retention-policy adaptive \
   --hybrid-prefix-eviction-policy cost_aware \
   --enable-hybrid-internal-checkpoints \

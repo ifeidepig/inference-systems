@@ -60,6 +60,9 @@ def run_case(
         hybrid_prefix_checkpoint_interval_blocks=args.interval_blocks,
         hybrid_prefix_checkpoint_interval_tokens=args.interval_tokens,
         hybrid_prefix_checkpoint_memory_bytes=checkpoint_bytes,
+        hybrid_prefix_checkpoint_dtype=getattr(
+            args, "checkpoint_dtype", "fp32"
+        ),
         hybrid_prefix_retention_policy=args.retention_policy,
         hybrid_prefix_eviction_policy=args.eviction_policy,
         enable_hybrid_internal_checkpoints=(
@@ -105,6 +108,11 @@ def run_case(
             ),
             "retention_policy": args.retention_policy if enabled else "none",
             "eviction_policy": args.eviction_policy if enabled else "none",
+            "checkpoint_dtype": (
+                getattr(args, "checkpoint_dtype", "fp32")
+                if enabled
+                else "none"
+            ),
             "elapsed_s": elapsed,
             "throughput_tok_s": len(output["token_ids"]) / elapsed,
             "ttft_ms": request["ttft_ms"],
@@ -135,6 +143,11 @@ def main() -> None:
     parser.add_argument("--interval-tokens", type=int, default=None)
     parser.add_argument("--prefix-match-unit", type=int, default=256)
     parser.add_argument("--checkpoint-memory-mib", type=int, default=512)
+    parser.add_argument(
+        "--checkpoint-dtype",
+        choices=("fp32", "bf16", "int8"),
+        default="fp32",
+    )
     parser.add_argument(
         "--retention-policy",
         choices=("periodic", "adaptive"),

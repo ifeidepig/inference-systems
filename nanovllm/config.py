@@ -42,6 +42,8 @@ class Config:
     hybrid_prefix_checkpoint_interval_blocks: int = 8
     hybrid_prefix_checkpoint_interval_tokens: int | None = None
     hybrid_prefix_checkpoint_memory_bytes: int = 0
+    hybrid_prefix_checkpoint_dtype: str = "fp32"
+    hybrid_prefix_promotion_min_sightings: int = 2
     hybrid_prefix_retention_policy: str = "periodic"
     hybrid_prefix_eviction_policy: str = "lru"
     enable_hybrid_internal_checkpoints: bool = False
@@ -93,6 +95,14 @@ class Config:
                     "checkpoint token interval must align to prefix_match_unit"
                 )
         assert self.hybrid_prefix_checkpoint_memory_bytes >= 0
+        if self.hybrid_prefix_checkpoint_dtype not in ("fp32", "bf16", "int8"):
+            raise ValueError(
+                "hybrid prefix checkpoint dtype must be fp32, bf16, or int8"
+            )
+        if self.hybrid_prefix_promotion_min_sightings < 2:
+            raise ValueError(
+                "hybrid prefix promotion requires at least two sightings"
+            )
         if self.hybrid_prefix_retention_policy not in ("periodic", "adaptive"):
             raise ValueError("unsupported hybrid prefix retention policy")
         if self.hybrid_prefix_eviction_policy not in ("lru", "cost_aware"):
@@ -133,16 +143,34 @@ class Config:
             key_dim = self.hf_config.linear_key_head_dim
             value_dim = self.hf_config.linear_value_head_dim
             conv_dim = 2 * num_key_heads * key_dim + num_value_heads * value_dim
-            self.hybrid_prefix_checkpoint_bytes_per_slot = (
+            recurrent_elements = (
                 num_linear_layers
                 * num_value_heads
                 * key_dim
                 * value_dim
-                * 4
-                + num_linear_layers
+            )
+            conv_bytes = (
+                num_linear_layers
                 * conv_dim
                 * (self.hf_config.linear_conv_kernel_dim - 1)
                 * self.hf_config.dtype.itemsize
+            )
+            if self.hybrid_prefix_checkpoint_dtype == "fp32":
+                recurrent_bytes = recurrent_elements * 4
+                scale_bytes = 0
+            elif self.hybrid_prefix_checkpoint_dtype == "bf16":
+                recurrent_bytes = recurrent_elements * 2
+                scale_bytes = 0
+            else:
+                recurrent_bytes = recurrent_elements
+                scale_bytes = (
+                    num_linear_layers
+                    * num_value_heads
+                    * key_dim
+                    * 4
+                )
+            self.hybrid_prefix_checkpoint_bytes_per_slot = (
+                recurrent_bytes + scale_bytes + conv_bytes
             )
             if (
                 self.hybrid_prefix_checkpoint_memory_bytes
