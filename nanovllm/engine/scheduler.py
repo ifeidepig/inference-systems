@@ -5,6 +5,7 @@ from time import perf_counter_ns
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.block_manager import BlockManager
+from nanovllm.engine.phase_profiler import PhaseProfiler
 from nanovllm.engine.hybrid_prefix_cache import (
     CheckpointBoundary,
     FullAttentionPrefixManager,
@@ -163,6 +164,9 @@ class Scheduler:
         self.prefill_ms_per_token_ewma = None
         self.prefill_base_ms = None
         self.decode_step_ms_ewma = None
+        self.mtp_phase_profiler = PhaseProfiler(
+            getattr(config, "enable_mtp_phase_profiling", False)
+        )
         self.reset_metrics()
 
     def _allocate_state(self, seq: Sequence) -> None:
@@ -205,6 +209,7 @@ class Scheduler:
         )
 
     def reset_metrics(self) -> None:
+        self.mtp_phase_profiler.reset()
         self.block_manager.reset_metrics()
         self.prefix_cache_queries = 0
         self.prefix_cache_eligible_blocks = 0
@@ -276,6 +281,9 @@ class Scheduler:
         }
         if self.hybrid_prefix_coordinator is not None:
             metrics.update(self.hybrid_prefix_coordinator.get_metrics())
+        metrics["mtp_scheduler_phase_profile"] = (
+            self.mtp_phase_profiler.metrics()
+        )
         return metrics
 
     def is_finished(self):
@@ -444,6 +452,13 @@ class Scheduler:
     def observe_batch(
         self, is_prefill: bool, num_tokens: int, duration_ms: float
     ) -> None:
+        if not is_prefill:
+            phase_name = (
+                "mtp.engine_model_runner_wall"
+                if self.num_speculative_tokens
+                else "target_only.engine_model_runner_wall"
+            )
+            self.mtp_phase_profiler.record_cpu(phase_name, duration_ms)
         if is_prefill:
             self.prefill_base_ms = (
                 duration_ms
@@ -635,6 +650,7 @@ class Scheduler:
         return scheduled_seqs
 
     def _schedule_decode(self, sequence_budget: int) -> list[Sequence]:
+        profiling_started = perf_counter_ns()
         scheduled_seqs = []
         append_reservation = self.num_speculative_tokens + 1
         while self.running and len(scheduled_seqs) < sequence_budget:
@@ -656,12 +672,21 @@ class Scheduler:
                 seq.num_scheduled_tokens = 1
                 seq.is_prefill = False
                 if self.num_speculative_tokens:
-                    self.block_manager.reserve_append(seq, append_reservation)
+                    with self.mtp_phase_profiler.phase(
+                        "scheduler.kv_reserve", gpu=False
+                    ):
+                        self.block_manager.reserve_append(
+                            seq, append_reservation
+                        )
                 else:
                     self.block_manager.may_append(seq)
                 seq.mark_scheduled()
                 scheduled_seqs.append(seq)
         self.running.extendleft(reversed(scheduled_seqs))
+        self.mtp_phase_profiler.record_cpu(
+            "scheduler.decode_admission",
+            (perf_counter_ns() - profiling_started) / 1e6,
+        )
         return scheduled_seqs
 
     def preempt(self, seq: Sequence):
@@ -905,6 +930,7 @@ class Scheduler:
         *,
         blocks_already_hashed: bool = False,
     ):
+        profiling_started = perf_counter_ns()
         generated_at_ns = perf_counter_ns()
         for seq, token_id in zip(seqs, token_ids):
             if self.enable_prefix_cache and not blocks_already_hashed:
@@ -925,6 +951,11 @@ class Scheduler:
                 self.completed_request_metrics.append(
                     seq.lifecycle_metrics(generated_at_ns)
                 )
+        if not is_prefill:
+            self.mtp_phase_profiler.record_cpu(
+                "target_only.scheduler_commit",
+                (perf_counter_ns() - profiling_started) / 1e6,
+            )
 
     def postprocess_speculative(
         self,
@@ -932,6 +963,7 @@ class Scheduler:
         output_token_ids: list[list[int]],
     ) -> None:
         """Commit greedy speculative outputs while keeping one pending token."""
+        profiling_started = perf_counter_ns()
         generated_at_ns = perf_counter_ns()
         for seq, tokens in zip(seqs, output_token_ids):
             if not tokens:
@@ -968,7 +1000,14 @@ class Scheduler:
                 )
             else:
                 seq.num_cached_tokens = len(seq) - 1
-                self.block_manager.trim_to_sequence_length(seq)
+                with self.mtp_phase_profiler.phase(
+                    "scheduler.kv_tail_reclaim", gpu=False
+                ):
+                    self.block_manager.trim_to_sequence_length(seq)
+        self.mtp_phase_profiler.record_cpu(
+            "scheduler.speculative_commit",
+            (perf_counter_ns() - profiling_started) / 1e6,
+        )
 
     def get_request_metrics(self) -> list[dict]:
         return list(self.completed_request_metrics)

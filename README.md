@@ -172,7 +172,14 @@ See [docs/fine-grained-hybrid-prefix-cache-report.md](docs/fine-grained-hybrid-p
 
 ### Native MTP
 
-The implementation is correctness-complete for the tested greedy path, including variable acceptance and recurrent-state transactions. On this 0.8B/local workload, MTP-2 remained approximately 15% slower than the fused target-only path at a 65.9% acceptance rate. This negative result is retained rather than presented as a speedup.
+The implementation is correctness-complete for the tested greedy path, including variable acceptance and recurrent-state transactions. In the latest 20-run 0.8B controlled workload, MTP-2 throughput remained 18.2% below the fused target-only path at a 65.9% acceptance rate. This negative result is retained rather than presented as a speedup.
+
+Phase-level profiling now attributes the measured negative result: parallel
+verify is the largest GPU phase, followed by target decode and three MTP steps
+(two drafts plus final shifted-KV alignment). The correctness-first state
+history is a significant memory consumer but is not the first latency
+bottleneck at batch 2, so ReplaySSM is not recommended yet. See
+[docs/mtp-phase-profiling.md](docs/mtp-phase-profiling.md).
 
 ### Scheduler and Serving
 

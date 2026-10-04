@@ -12,7 +12,7 @@ transactions, rather than timing an isolated model kernel.
 import argparse
 import gc
 import json
-from statistics import mean, pstdev
+from statistics import mean, median, pstdev
 from time import perf_counter
 
 import torch
@@ -24,6 +24,85 @@ DEFAULT_PROMPTS = [
     [9707, 11, 1879, 0],
     [151643, 8948, 198, 17, 18],
 ]
+
+
+def distribution(values: list[float]) -> dict[str, float]:
+    ordered = sorted(float(value) for value in values)
+    return {
+        "median": median(ordered),
+        "p95": ordered[min(int(len(ordered) * 0.95), len(ordered) - 1)],
+        "q1": ordered[len(ordered) // 4],
+        "q3": ordered[(3 * len(ordered)) // 4],
+    }
+
+
+def summarize_phase_profiles(runs: list[dict], owner: str) -> dict:
+    profile_key = (
+        "mtp_phase_profile"
+        if owner == "model_runner"
+        else "mtp_scheduler_phase_profile"
+    )
+    profiles = [run[owner][profile_key] for run in runs]
+    if not profiles or not profiles[0]["enabled"]:
+        return {"enabled": False}
+    phase_names = sorted(
+        {
+            name
+            for profile in profiles
+            for name in profile["phases"]
+        }
+    )
+    return {
+        "enabled": True,
+        "phases": {
+            name: {
+                "cpu_median_ms_across_runs": distribution(
+                    [
+                        profile["phases"][name]["cpu_ms"]["median"]
+                        for profile in profiles
+                        if name in profile["phases"]
+                    ]
+                ),
+                "cpu_p95_ms_across_runs": distribution(
+                    [
+                        profile["phases"][name]["cpu_ms"]["p95"]
+                        for profile in profiles
+                        if name in profile["phases"]
+                    ]
+                ),
+                "gpu_median_ms_across_runs": distribution(
+                    [
+                        profile["phases"][name]["gpu_ms"]["median"]
+                        for profile in profiles
+                        if name in profile["phases"]
+                    ]
+                ),
+                "gpu_p95_ms_across_runs": distribution(
+                    [
+                        profile["phases"][name]["gpu_ms"]["p95"]
+                        for profile in profiles
+                        if name in profile["phases"]
+                    ]
+                ),
+            }
+            for name in phase_names
+        },
+        "counters": {
+            name: distribution(
+                [
+                    profile["counters"].get(name, 0.0)
+                    for profile in profiles
+                ]
+            )
+            for name in sorted(
+                {
+                    name
+                    for profile in profiles
+                    for name in profile["counters"]
+                }
+            )
+        },
+    }
 
 
 def run_once(args, num_speculative_tokens: int) -> dict:
@@ -39,6 +118,7 @@ def run_once(args, num_speculative_tokens: int) -> dict:
         num_speculative_tokens=num_speculative_tokens,
         speculative_parallel_verify=args.parallel_verify,
         gdn_decode_backend=args.gdn_decode_backend,
+        enable_mtp_phase_profiling=args.phase_profile,
     )
     sampling = SamplingParams(
         temperature=0.0,
@@ -59,14 +139,24 @@ def run_once(args, num_speculative_tokens: int) -> dict:
         engine.reset_runtime_metrics()
         torch.cuda.reset_peak_memory_stats()
         started = perf_counter()
-        outputs = engine.generate(
-            DEFAULT_PROMPTS,
-            sampling,
-            use_tqdm=False,
-        )
+        torch.cuda.nvtx.range_push("benchmark.measured")
+        try:
+            outputs = engine.generate(
+                DEFAULT_PROMPTS,
+                sampling,
+                use_tqdm=False,
+            )
+        finally:
+            torch.cuda.nvtx.range_pop()
         elapsed = perf_counter() - started
         request_metrics = engine.get_request_metrics()[-len(DEFAULT_PROMPTS) :]
+        tpot_values = [
+            item["tpot_ms"]
+            for item in request_metrics
+            if item["tpot_ms"] is not None
+        ]
         output_count = sum(len(item["token_ids"]) for item in outputs)
+        runtime_metrics = engine.get_runtime_metrics()
         return {
             "num_speculative_tokens": num_speculative_tokens,
             "gdn_decode_backend": args.gdn_decode_backend,
@@ -75,8 +165,9 @@ def run_once(args, num_speculative_tokens: int) -> dict:
             "throughput_tok_s": output_count / elapsed,
             "peak_allocated_gib": torch.cuda.max_memory_allocated() / 2**30,
             "mean_ttft_ms": mean(item["ttft_ms"] for item in request_metrics),
-            "mean_tpot_ms": mean(item["tpot_ms"] for item in request_metrics),
-            "model_runner": engine.get_runtime_metrics()["model_runner"],
+            "mean_tpot_ms": mean(tpot_values) if tpot_values else None,
+            "model_runner": runtime_metrics["model_runner"],
+            "scheduler": runtime_metrics["scheduler"],
             "token_ids": [item["token_ids"] for item in outputs],
         }
     finally:
@@ -90,6 +181,11 @@ def summarize_runs(runs: list[dict]) -> dict:
     if len(runs) == 1:
         return runs[0]
     token_ids = runs[0]["token_ids"]
+    tpot_values = [
+        run["mean_tpot_ms"]
+        for run in runs
+        if run["mean_tpot_ms"] is not None
+    ]
     return {
         "num_speculative_tokens": runs[0]["num_speculative_tokens"],
         "gdn_decode_backend": runs[0]["gdn_decode_backend"],
@@ -100,13 +196,22 @@ def summarize_runs(runs: list[dict]) -> dict:
         "throughput_tok_s_std": pstdev(
             run["throughput_tok_s"] for run in runs
         ),
+        "throughput_tok_s_distribution": distribution(
+            [run["throughput_tok_s"] for run in runs]
+        ),
         "mean_ttft_ms": mean(run["mean_ttft_ms"] for run in runs),
-        "mean_tpot_ms": mean(run["mean_tpot_ms"] for run in runs),
+        "mean_tpot_ms": mean(tpot_values) if tpot_values else None,
         "peak_allocated_gib_max": max(
             run["peak_allocated_gib"] for run in runs
         ),
         "tokens_stable_across_repetitions": all(
             run["token_ids"] == token_ids for run in runs
+        ),
+        "model_runner_phase_summary": summarize_phase_profiles(
+            runs, "model_runner"
+        ),
+        "scheduler_phase_summary": summarize_phase_profiles(
+            runs, "scheduler"
         ),
         "token_ids": token_ids,
         "runs": runs,
@@ -120,6 +225,7 @@ def main() -> None:
         "--mode", choices=("baseline", "mtp", "both"), default="both"
     )
     parser.add_argument("--num-speculative-tokens", type=int, default=2)
+    parser.add_argument("--phase-profile", action="store_true")
     parser.add_argument(
         "--gdn-decode-backend",
         choices=("torch", "cuda", "auto"),

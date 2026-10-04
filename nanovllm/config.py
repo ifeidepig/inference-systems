@@ -37,6 +37,7 @@ class Config:
     max_num_state_slots: int = 1
     num_speculative_tokens: int = 0
     speculative_parallel_verify: bool = True
+    enable_mtp_phase_profiling: bool = False
     gdn_decode_backend: str = "torch"
     enable_hybrid_prefix_cache: bool = False
     hybrid_prefix_checkpoint_interval_blocks: int = 8

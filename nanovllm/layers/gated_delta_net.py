@@ -6,11 +6,13 @@ any Triton or fused backend is introduced.
 """
 
 import os
+from contextlib import nullcontext
 
 import torch
 from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
+from torch.profiler import record_function
 
 from nanovllm.layers.layernorm import Qwen3_5RMSNormGated
 from nanovllm.kernels.gdn import gdn_decode_core, validate_gdn_decode_backend
@@ -43,6 +45,9 @@ class GatedDeltaNet(nn.Module):
                 "gdn_decode_backend",
                 os.environ.get("NANOVLLM_GDN_DECODE_BACKEND", "torch"),
             )
+        )
+        self.profile_state_history = bool(
+            getattr(config, "enable_mtp_phase_profiling", False)
         )
 
         if self.num_value_heads % self.num_key_heads:
@@ -231,6 +236,7 @@ class GatedDeltaNet(nn.Module):
                 recurrent_state=sequence_recurrent_state,
                 return_state_history=return_state_history,
                 checkpoint_indices=state_checkpoint_indices,
+                profile_state_history=self.profile_state_history,
             )
             core_output = core.output.to(hidden_states.dtype)
             gate = z[start:end].reshape(
@@ -247,12 +253,20 @@ class GatedDeltaNet(nn.Module):
             new_conv_states.append(core.conv_state.to(hidden_states.dtype))
             new_recurrent_states.append(core.recurrent_state)
             if return_state_history or state_checkpoint_indices is not None:
-                conv_state_histories.append(
-                    core.conv_state_history.squeeze(0).to(hidden_states.dtype)
+                context = (
+                    record_function("gdn.history.layer_pack")
+                    if self.profile_state_history
+                    else nullcontext()
                 )
-                recurrent_state_histories.append(
-                    core.recurrent_state_history.squeeze(0)
-                )
+                with context:
+                    conv_state_histories.append(
+                        core.conv_state_history.squeeze(0).to(
+                            hidden_states.dtype
+                        )
+                    )
+                    recurrent_state_histories.append(
+                        core.recurrent_state_history.squeeze(0)
+                    )
 
         result = (
             torch.cat(outputs, dim=0),
@@ -260,10 +274,16 @@ class GatedDeltaNet(nn.Module):
             torch.cat(new_conv_states, dim=0),
         )
         if return_state_history or state_checkpoint_indices is not None:
-            return result + (
-                torch.cat(recurrent_state_histories, dim=0),
-                torch.cat(conv_state_histories, dim=0),
+            context = (
+                record_function("gdn.history.layer_cat")
+                if self.profile_state_history
+                else nullcontext()
             )
+            with context:
+                return result + (
+                    torch.cat(recurrent_state_histories, dim=0),
+                    torch.cat(conv_state_histories, dim=0),
+                )
         return result
 
     def _forward_batched_decode(

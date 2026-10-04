@@ -1,5 +1,6 @@
 import pickle
-from time import perf_counter
+from contextlib import nullcontext
+from time import perf_counter, perf_counter_ns
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -13,6 +14,7 @@ from nanovllm.engine.state_manager import (
     transactional_restore_prefix_checkpoint,
 )
 from nanovllm.engine.sequence import Sequence
+from nanovllm.engine.phase_profiler import PhaseProfiler
 from nanovllm.layers.gated_delta_net import GatedDeltaNet
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.models.registry import create_model
@@ -43,6 +45,9 @@ class ModelRunner:
         self.rank = rank
         self.event = event
         self.ack_event = ack_event
+        self.mtp_phase_profiler = PhaseProfiler(
+            getattr(config, "enable_mtp_phase_profiling", False)
+        )
         self.reset_metrics()
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
@@ -53,6 +58,9 @@ class ModelRunner:
         # The model receives the normalized HF config, so propagate the
         # engine-level backend choice before constructing GDN layers.
         hf_config.gdn_decode_backend = config.gdn_decode_backend
+        hf_config.enable_mtp_phase_profiling = getattr(
+            config, "enable_mtp_phase_profiling", False
+        )
         # get_rope caches a shared module to avoid duplicating the large
         # cos/sin table across layers. Drop modules created by an earlier
         # CPU/model instance before constructing this CUDA model.
@@ -565,10 +573,20 @@ class ModelRunner:
         input_ids: torch.Tensor,
         target_positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        *,
+        profile_name: str | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        self._set_offset_decode_context(
-            seqs, target_positions, mtp_cache=True
-        )
+        def profile(suffix: str):
+            if profile_name is None:
+                return nullcontext()
+            return self.mtp_phase_profiler.phase(
+                f"{profile_name}.{suffix}"
+            )
+
+        with profile("context"):
+            self._set_offset_decode_context(
+                seqs, target_positions, mtp_cache=True
+            )
         if not self.enforce_eager and hasattr(self, "mtp_graphs"):
             real_batch_size = input_ids.size(0)
             graph_batch_size = next(
@@ -576,30 +594,37 @@ class ModelRunner:
             )
             context = get_context()
             variables = self.mtp_graph_vars
-            variables["input_ids"][:real_batch_size] = input_ids
-            variables["positions"][:real_batch_size] = target_positions
-            variables["hidden_states"][:real_batch_size] = hidden_states
-            variables["slot_mapping"].fill_(-1)
-            variables["slot_mapping"][:real_batch_size] = context.slot_mapping
-            variables["context_lens"].zero_()
-            variables["context_lens"][:real_batch_size] = context.context_lens
-            variables["block_tables"].fill_(-1)
-            variables["block_tables"][
-                :real_batch_size,
-                : context.block_tables.size(1),
-            ] = context.block_tables
-            self.mtp_graphs[graph_batch_size].replay()
+            with profile("buffer_update"):
+                variables["input_ids"][:real_batch_size] = input_ids
+                variables["positions"][:real_batch_size] = target_positions
+                variables["hidden_states"][:real_batch_size] = hidden_states
+                variables["slot_mapping"].fill_(-1)
+                variables["slot_mapping"][:real_batch_size] = context.slot_mapping
+                variables["context_lens"].zero_()
+                variables["context_lens"][:real_batch_size] = context.context_lens
+                variables["block_tables"].fill_(-1)
+                variables["block_tables"][
+                    :real_batch_size,
+                    : context.block_tables.size(1),
+                ] = context.block_tables
+            with profile("forward"):
+                self.mtp_graphs[graph_batch_size].replay()
             draft_hidden = variables["outputs"][:real_batch_size]
             self.mtp_cudagraph_replays += 1
-            return draft_hidden, self.model.compute_logits(draft_hidden)
+            with profile("lm_head"):
+                draft_logits = self.model.compute_logits(draft_hidden)
+            return draft_hidden, draft_logits
         cu = get_context().cu_seqlens_q
-        draft_hidden = self.mtp(
-            input_ids,
-            target_positions,
-            hidden_states,
-            cu,
-        )
-        return draft_hidden, self.model.compute_logits(draft_hidden)
+        with profile("forward"):
+            draft_hidden = self.mtp(
+                input_ids,
+                target_positions,
+                hidden_states,
+                cu,
+            )
+        with profile("lm_head"):
+            draft_logits = self.model.compute_logits(draft_hidden)
+        return draft_hidden, draft_logits
 
     def _distributed_greedy_tokens(
         self,
@@ -828,6 +853,7 @@ class ModelRunner:
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def reset_metrics(self):
+        self.mtp_phase_profiler.reset()
         self.prefill_model_runs = 0
         self.decode_eager_runs = 0
         self.decode_cudagraph_replays = 0
@@ -999,6 +1025,7 @@ class ModelRunner:
                 if self.speculative_proposed_tokens
                 else 0.0
             ),
+            "mtp_phase_profile": self.mtp_phase_profiler.metrics(),
         }
         if self.prefix_checkpoint_pool is not None:
             metrics.update(
@@ -1055,8 +1082,23 @@ class ModelRunner:
         is_prefill: bool,
         internal_prefix_boundaries: dict[int, tuple[int, ...]] | None = None,
     ) -> list[int]:
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        if is_prefill:
+            input_ids, positions = self.prepare_prefill(seqs)
+        else:
+            with self.mtp_phase_profiler.phase(
+                "target_only.prepare_decode"
+            ):
+                input_ids, positions = self.prepare_decode(seqs)
+        if is_prefill:
+            temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        else:
+            with self.mtp_phase_profiler.phase(
+                "target_only.prepare_sample",
+                gpu=self.rank == 0,
+            ):
+                temperatures = (
+                    self.prepare_sample(seqs) if self.rank == 0 else None
+                )
         if is_prefill and internal_prefix_boundaries:
             if len(seqs) != 1:
                 raise RuntimeError("internal checkpoints require one prefill sequence")
@@ -1153,8 +1195,29 @@ class ModelRunner:
                 )
             token_ids = sampled.tolist() if self.rank == 0 else None
         else:
-            logits = self.run_model(input_ids, positions, is_prefill)
-            token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+            if is_prefill:
+                logits = self.run_model(input_ids, positions, is_prefill)
+                token_ids = (
+                    self.sampler(logits, temperatures).tolist()
+                    if self.rank == 0
+                    else None
+                )
+            else:
+                with self.mtp_phase_profiler.phase(
+                    "target_only.decode_forward"
+                ):
+                    logits = self.run_model(input_ids, positions, is_prefill)
+                with self.mtp_phase_profiler.phase(
+                    "target_only.sample",
+                    gpu=self.rank == 0,
+                ):
+                    token_ids = (
+                        self.sampler(logits, temperatures).tolist()
+                        if self.rank == 0
+                        else None
+                    )
+        if not is_prefill:
+            self.mtp_phase_profiler.flush()
         reset_context()
         return token_ids
 
@@ -1171,27 +1234,32 @@ class ModelRunner:
         if any(seq.temperature > 1e-10 for seq in seqs):
             raise ValueError("native MTP currently supports greedy sampling only")
 
+        iteration_started_ns = perf_counter_ns()
         batch_size = len(seqs)
-        input_ids, positions = self.prepare_decode(seqs)
-        if self.enforce_eager:
-            target_hidden, target_logits = self._forward_target_eager(
-                input_ids, positions
+        with self.mtp_phase_profiler.phase("mtp.prepare_decode"):
+            input_ids, positions = self.prepare_decode(seqs)
+        with self.mtp_phase_profiler.phase("mtp.target_decode"):
+            if self.enforce_eager:
+                target_hidden, target_logits = self._forward_target_eager(
+                    input_ids, positions
+                )
+            else:
+                target_hidden, target_logits = self._replay_hybrid_decode_graph(
+                    input_ids, positions
+                )
+                self.speculative_target_cudagraph_replays += 1
+        with self.mtp_phase_profiler.phase("mtp.base_argmax"):
+            target_state_slot_ids = get_context().state_slot_ids.clone()
+            base_tokens = self._distributed_greedy_tokens(
+                target_logits, batch_size
             )
-        else:
-            target_hidden, target_logits = self._replay_hybrid_decode_graph(
-                input_ids, positions
-            )
-            self.speculative_target_cudagraph_replays += 1
-        target_state_slot_ids = get_context().state_slot_ids.clone()
-        base_tokens = self._distributed_greedy_tokens(
-            target_logits, batch_size
-        )
 
-        initial_lengths = torch.tensor(
-            [len(seq) for seq in seqs],
-            dtype=torch.long,
-            device="cuda",
-        )
+        with self.mtp_phase_profiler.phase("mtp.initial_metadata"):
+            initial_lengths = torch.tensor(
+                [len(seq) for seq in seqs],
+                dtype=torch.long,
+                device="cuda",
+            )
         proposals = []
         draft_input = base_tokens
         draft_hidden = target_hidden
@@ -1202,63 +1270,70 @@ class ModelRunner:
                 draft_input,
                 draft_positions,
                 draft_hidden,
+                profile_name=f"mtp.draft.{step}",
             )
-            draft_input = self._distributed_greedy_tokens(
-                draft_logits, batch_size
-            )
+            with self.mtp_phase_profiler.phase(
+                f"mtp.draft.{step}.argmax"
+            ):
+                draft_input = self._distributed_greedy_tokens(
+                    draft_logits, batch_size
+                )
             proposals.append(draft_input)
         proposal_tokens = torch.stack(proposals, dim=1)
 
         if self.speculative_parallel_verify:
-            verify_rows = [
-                torch.cat(
-                    (
-                        base_tokens[index : index + 1],
-                        proposal_tokens[index, :-1],
+            with self.mtp_phase_profiler.phase("mtp.verify_prepare"):
+                verify_rows = [
+                    torch.cat(
+                        (
+                            base_tokens[index : index + 1],
+                            proposal_tokens[index, :-1],
+                        )
                     )
+                    for index in range(batch_size)
+                ]
+                verify_ids, verify_positions = self._prepare_target_verify_chunk(
+                    seqs, verify_rows
                 )
-                for index in range(batch_size)
-            ]
-            verify_ids, verify_positions = self._prepare_target_verify_chunk(
-                seqs, verify_rows
-            )
-            if (
-                not self.enforce_eager
-                and hasattr(self, "verify_graphs")
-                and batch_size in self.verify_graphs
-            ):
-                (
-                    all_hidden,
+            with self.mtp_phase_profiler.phase("mtp.verify_forward"):
+                if (
+                    not self.enforce_eager
+                    and hasattr(self, "verify_graphs")
+                    and batch_size in self.verify_graphs
+                ):
+                    (
+                        all_hidden,
+                        all_logits,
+                        recurrent_histories,
+                        conv_histories,
+                    ) = self._replay_verify_graph(
+                        verify_ids,
+                        verify_positions,
+                        batch_size,
+                    )
+                else:
+                    (
+                        all_hidden,
+                        all_logits,
+                        recurrent_histories,
+                        conv_histories,
+                    ) = self._forward_target_eager(
+                        verify_ids,
+                        verify_positions,
+                        all_logits=True,
+                        return_state_history=True,
+                    )
+            with self.mtp_phase_profiler.phase("mtp.verify_argmax"):
+                target_tokens = self._distributed_greedy_matrix(
                     all_logits,
-                    recurrent_histories,
-                    conv_histories,
-                ) = self._replay_verify_graph(
-                    verify_ids,
-                    verify_positions,
                     batch_size,
+                    self.num_speculative_tokens,
                 )
-            else:
-                (
-                    all_hidden,
-                    all_logits,
-                    recurrent_histories,
-                    conv_histories,
-                ) = self._forward_target_eager(
-                    verify_ids,
-                    verify_positions,
-                    all_logits=True,
-                    return_state_history=True,
+                hidden_stack = all_hidden.view(
+                    batch_size,
+                    self.num_speculative_tokens,
+                    -1,
                 )
-            target_tokens = self._distributed_greedy_matrix(
-                all_logits,
-                batch_size,
-                self.num_speculative_tokens,
-            )
-            hidden_stack = all_hidden.view(
-                batch_size,
-                self.num_speculative_tokens,
-                -1,
-            )
             if self.rank == 0:
                 self.speculative_verify_forwards += 1
         else:
@@ -1294,114 +1369,162 @@ class ModelRunner:
             if self.rank == 0:
                 self.speculative_verify_forwards += self.num_speculative_tokens
 
-        if self.rank == 0:
-            verification = greedy_verify_tokens(
-                proposal_tokens, target_tokens
-            )
-            accepted_lengths = verification.accepted_lengths.to(
-                device="cuda"
-            )
-        else:
-            verification = None
-            accepted_lengths = torch.empty(
-                batch_size, dtype=torch.int32, device="cuda"
-            )
-        if self.world_size > 1:
-            dist.broadcast(accepted_lengths, src=0)
+        with self.mtp_phase_profiler.phase(
+            "mtp.accept_reject", gpu=False
+        ):
+            if self.rank == 0:
+                verification = greedy_verify_tokens(
+                    proposal_tokens, target_tokens
+                )
+                accepted_lengths = verification.accepted_lengths.to(
+                    device="cuda"
+                )
+            else:
+                verification = None
+                accepted_lengths = torch.empty(
+                    batch_size, dtype=torch.int32, device="cuda"
+                )
+            if self.world_size > 1:
+                dist.broadcast(accepted_lengths, src=0)
 
-        state_boundaries = accepted_lengths.clamp_max(
-            self.num_speculative_tokens - 1
-        )
-        if self.speculative_parallel_verify:
-            history_indices = (
-                torch.arange(batch_size, device="cuda")
-                * self.num_speculative_tokens
-                + state_boundaries.to(torch.long)
+        with self.mtp_phase_profiler.phase("mtp.state_boundary"):
+            state_boundaries = accepted_lengths.clamp_max(
+                self.num_speculative_tokens - 1
             )
-            selected_recurrent = [
-                None
-                if history is None
-                else history.index_select(0, history_indices)
-                for history in recurrent_histories
-            ]
-            selected_conv = [
-                None
-                if history is None
-                else history.index_select(0, history_indices)
-                for history in conv_histories
-            ]
-            self.state_manager.scatter(
-                target_state_slot_ids,
-                selected_recurrent,
-                selected_conv,
-                linear_layer_indices=(
-                    self.model.model.linear_attention_layer_indices
-                ),
+        if self.speculative_parallel_verify:
+            with self.mtp_phase_profiler.phase("mtp.state_select"):
+                history_indices = (
+                    torch.arange(batch_size, device="cuda")
+                    * self.num_speculative_tokens
+                    + state_boundaries.to(torch.long)
+                )
+                selected_recurrent = [
+                    None
+                    if history is None
+                    else history.index_select(0, history_indices)
+                    for history in recurrent_histories
+                ]
+                selected_conv = [
+                    None
+                    if history is None
+                    else history.index_select(0, history_indices)
+                    for history in conv_histories
+                ]
+            with self.mtp_phase_profiler.phase("mtp.state_scatter"):
+                self.state_manager.scatter(
+                    target_state_slot_ids,
+                    selected_recurrent,
+                    selected_conv,
+                    linear_layer_indices=(
+                        self.model.model.linear_attention_layer_indices
+                    ),
+                )
+            history_bytes = sum(
+                history.numel() * history.element_size()
+                for history in recurrent_histories + conv_histories
+                if history is not None
+            )
+            selected_state_bytes = sum(
+                state.numel() * state.element_size()
+                for state in selected_recurrent + selected_conv
+                if state is not None
+            )
+            self.mtp_phase_profiler.add_counter(
+                "state_history_materialized_bytes", history_bytes
+            )
+            self.mtp_phase_profiler.add_counter(
+                "selected_state_bytes", selected_state_bytes
+            )
+            self.mtp_phase_profiler.add_counter(
+                "state_scatter_logical_bytes", selected_state_bytes
             )
         else:
             # Snapshot zero is after the guaranteed base token; snapshot i is
             # after i further accepted proposals. If all are accepted, the
             # final proposal stays pending and uses the last snapshot.
-            transaction.commit(state_boundaries)
+            with self.mtp_phase_profiler.phase("mtp.state_transaction"):
+                transaction.commit(state_boundaries)
 
-        if self.rank == 0:
-            output_tokens = [
-                [int(base)] + verified
-                for base, verified in zip(
-                    base_tokens.to("cpu").tolist(),
-                    verification.output_tokens,
+        with self.mtp_phase_profiler.phase(
+            "mtp.output_metadata", gpu=False
+        ):
+            if self.rank == 0:
+                output_tokens = [
+                    [int(base)] + verified
+                    for base, verified in zip(
+                        base_tokens.to("cpu").tolist(),
+                        verification.output_tokens,
+                    )
+                ]
+                final_tokens = torch.tensor(
+                    [tokens[-1] for tokens in output_tokens],
+                    dtype=torch.long,
+                    device="cuda",
                 )
+                final_positions = torch.tensor(
+                    [
+                        len(seq) + len(tokens) - 1
+                        for seq, tokens in zip(seqs, output_tokens)
+                    ],
+                    dtype=torch.long,
+                    device="cuda",
+                )
+                accepted_cpu = verification.accepted_lengths.to("cpu").tolist()
+                self.speculative_decode_rounds += 1
+                self.speculative_proposed_tokens += (
+                    batch_size * self.num_speculative_tokens
+                )
+                self.speculative_accepted_tokens += sum(accepted_cpu)
+                self.speculative_emitted_tokens += sum(
+                    len(tokens) for tokens in output_tokens
+                )
+                self.speculative_rejected_sequences += sum(
+                    accepted < self.num_speculative_tokens
+                    for accepted in accepted_cpu
+                )
+            else:
+                output_tokens = None
+                final_tokens = torch.empty(
+                    batch_size, dtype=torch.long, device="cuda"
+                )
+                final_positions = torch.empty(
+                    batch_size, dtype=torch.long, device="cuda"
+                )
+            if self.world_size > 1:
+                dist.broadcast(final_tokens, src=0)
+                dist.broadcast(final_positions, src=0)
+        with self.mtp_phase_profiler.phase("mtp.hidden_select"):
+            selected_hidden = hidden_stack[
+                torch.arange(batch_size, device="cuda"),
+                state_boundaries.to(torch.long),
             ]
-            final_tokens = torch.tensor(
-                [tokens[-1] for tokens in output_tokens],
-                dtype=torch.long,
-                device="cuda",
-            )
-            final_positions = torch.tensor(
-                [
-                    len(seq) + len(tokens) - 1
-                    for seq, tokens in zip(seqs, output_tokens)
-                ],
-                dtype=torch.long,
-                device="cuda",
-            )
-            accepted_cpu = verification.accepted_lengths.to("cpu").tolist()
-            self.speculative_decode_rounds += 1
-            self.speculative_proposed_tokens += (
-                batch_size * self.num_speculative_tokens
-            )
-            self.speculative_accepted_tokens += sum(accepted_cpu)
-            self.speculative_emitted_tokens += sum(
-                len(tokens) for tokens in output_tokens
-            )
-            self.speculative_rejected_sequences += sum(
-                accepted < self.num_speculative_tokens
-                for accepted in accepted_cpu
-            )
-        else:
-            output_tokens = None
-            final_tokens = torch.empty(
-                batch_size, dtype=torch.long, device="cuda"
-            )
-            final_positions = torch.empty(
-                batch_size, dtype=torch.long, device="cuda"
-            )
-        if self.world_size > 1:
-            dist.broadcast(final_tokens, src=0)
-            dist.broadcast(final_positions, src=0)
-        selected_hidden = hidden_stack[
-            torch.arange(batch_size, device="cuda"),
-            state_boundaries.to(torch.long),
-        ]
         # Correct/complete the shifted MTP KV at the final emitted token.
         self._mtp_step(
             seqs,
             final_tokens,
             final_positions,
             selected_hidden,
+            profile_name="mtp.final_alignment",
         )
         if self.enforce_eager:
             self.decode_eager_runs += 1
+        self.mtp_phase_profiler.add_counter("iterations", 1)
+        self.mtp_phase_profiler.add_counter(
+            "iteration_body_cpu_ms",
+            (perf_counter_ns() - iteration_started_ns) / 1e6,
+        )
+        if hasattr(self, "verify_graph_vars"):
+            graph_history_bytes = (
+                self.verify_graph_vars["recurrent_history"].numel()
+                * self.verify_graph_vars["recurrent_history"].element_size()
+                + self.verify_graph_vars["conv_history"].numel()
+                * self.verify_graph_vars["conv_history"].element_size()
+            )
+            self.mtp_phase_profiler.set_counter(
+                "verify_graph_history_capacity_bytes",
+                graph_history_bytes,
+            )
+        self.mtp_phase_profiler.flush()
         reset_context()
         return output_tokens
 

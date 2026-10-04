@@ -8,9 +8,11 @@ nano-vLLM's tests.
 """
 
 from dataclasses import dataclass
+from contextlib import nullcontext
 
 import torch
 import torch.nn.functional as F
+from torch.profiler import record_function
 
 
 @dataclass(frozen=True)
@@ -46,6 +48,7 @@ def short_causal_conv_reference(
     *,
     return_state_history: bool = False,
     checkpoint_indices: tuple[int, ...] | None = None,
+    profile_state_history: bool = False,
 ):
     """Apply depthwise causal convolution one token at a time.
 
@@ -102,18 +105,30 @@ def short_causal_conv_reference(
         if capture_states and (
             return_state_history or token_idx in checkpoint_set
         ):
-            state_history.append(state.clone())
+            context = (
+                record_function("gdn.history.conv.clone")
+                if profile_state_history
+                else nullcontext()
+            )
+            with context:
+                state_history.append(state.clone())
 
     if outputs:
         output = torch.stack(outputs, dim=1)
     else:
         output = x.new_empty((batch_size, 0, conv_dim))
     if capture_states:
-        history = (
-            torch.stack(state_history, dim=1)
-            if state_history
-            else state[:, None, :, :][:, :0]
+        context = (
+            record_function("gdn.history.conv.stack")
+            if profile_state_history
+            else nullcontext()
         )
+        with context:
+            history = (
+                torch.stack(state_history, dim=1)
+                if state_history
+                else state[:, None, :, :][:, :0]
+            )
         return output, state, history
     return output, state
 
@@ -129,6 +144,7 @@ def recurrent_gated_delta_reference(
     normalize_qk: bool = True,
     return_state_history: bool = False,
     checkpoint_indices: tuple[int, ...] | None = None,
+    profile_state_history: bool = False,
 ):
     """Run the gated delta rule as an explicit token-by-token FP32 scan.
 
@@ -192,18 +208,30 @@ def recurrent_gated_delta_reference(
         if capture_states and (
             return_state_history or token_idx in checkpoint_set
         ):
-            state_history.append(state.clone())
+            context = (
+                record_function("gdn.history.recurrent.clone")
+                if profile_state_history
+                else nullcontext()
+            )
+            with context:
+                state_history.append(state.clone())
 
     if outputs:
         output = torch.stack(outputs, dim=1)
     else:
         output = v.new_empty((batch_size, 0, num_heads, value_head_dim))
     if capture_states:
-        history = (
-            torch.stack(state_history, dim=1)
-            if state_history
-            else state[:, None, ...][:, :0]
+        context = (
+            record_function("gdn.history.recurrent.stack")
+            if profile_state_history
+            else nullcontext()
         )
+        with context:
+            history = (
+                torch.stack(state_history, dim=1)
+                if state_history
+                else state[:, None, ...][:, :0]
+            )
         return output, state, history
     return output, state
 
@@ -224,6 +252,7 @@ def gated_delta_core_reference(
     recurrent_state: torch.Tensor | None = None,
     return_state_history: bool = False,
     checkpoint_indices: tuple[int, ...] | None = None,
+    profile_state_history: bool = False,
 ) -> GatedDeltaCoreOutput:
     """Reference the convolution + recurrent core before z-gated output.
 
@@ -255,6 +284,7 @@ def gated_delta_core_reference(
         conv_state,
         return_state_history=return_state_history,
         checkpoint_indices=checkpoint_indices,
+        profile_state_history=profile_state_history,
     )
     capture_states = return_state_history or checkpoint_indices is not None
     if capture_states:
@@ -288,6 +318,7 @@ def gated_delta_core_reference(
         recurrent_state,
         return_state_history=return_state_history,
         checkpoint_indices=checkpoint_indices,
+        profile_state_history=profile_state_history,
     )
     if capture_states:
         output, final_recurrent_state, recurrent_state_history = recurrent_result

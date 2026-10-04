@@ -269,6 +269,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--slo-latency-safety-margin-ms", type=float, default=5.0)
     parser.add_argument("--stream-queue-size", type=int, default=16)
     parser.add_argument("--num-speculative-tokens", type=int, default=0)
+    parser.add_argument("--enable-mtp-phase-profiling", action="store_true")
     parser.add_argument(
         "--gdn-decode-backend",
         choices=("torch", "cuda", "auto"),
@@ -362,6 +363,7 @@ def main() -> None:
         enable_prefix_cache=not args.disable_prefix_cache,
         enable_chunked_prefill=not args.disable_chunked_prefill,
         num_speculative_tokens=args.num_speculative_tokens,
+        enable_mtp_phase_profiling=args.enable_mtp_phase_profiling,
         gdn_decode_backend=args.gdn_decode_backend,
         speculative_parallel_verify=not args.sequential_speculative_verify,
         enable_hybrid_prefix_cache=args.enable_hybrid_prefix_cache,
