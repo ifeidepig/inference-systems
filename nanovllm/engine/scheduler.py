@@ -30,6 +30,27 @@ class ScheduledBatch:
         return len(self.seqs)
 
 
+@dataclass(frozen=True, slots=True)
+class AdmissionProbe:
+    sequence: Sequence
+    queue_index: int
+    reusable_tokens: int
+    kv_candidate_tokens: int
+    uncached_tokens: int
+    age_ms: float
+    score: float
+    feasible: bool
+
+
+@dataclass(frozen=True, slots=True)
+class PreemptionProbe:
+    sequence: Sequence
+    reclaimable_blocks: int
+    reusable_tokens: int
+    recompute_tokens: int
+    cost_per_block: float
+
+
 class Scheduler:
 
     def __init__(
@@ -44,6 +65,27 @@ class Scheduler:
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
         self.scheduling_policy = config.scheduling_policy
+        self.waiting_admission_policy = getattr(
+            config, "waiting_admission_policy", "fcfs"
+        )
+        self.preemption_policy = getattr(
+            config, "preemption_policy", "lifo"
+        )
+        self.hybrid_scheduler_candidate_window = getattr(
+            config, "hybrid_scheduler_candidate_window", 8
+        )
+        self.hybrid_scheduler_aging_tokens_per_ms = getattr(
+            config, "hybrid_scheduler_aging_tokens_per_ms", 0.5
+        )
+        self.hybrid_scheduler_max_wait_ms = getattr(
+            config, "hybrid_scheduler_max_wait_ms", 200.0
+        )
+        self.hybrid_scheduler_min_saved_tokens = getattr(
+            config, "hybrid_scheduler_min_saved_tokens", 16
+        )
+        self.hybrid_scheduler_preemption_penalty = getattr(
+            config, "hybrid_scheduler_preemption_penalty", 128.0
+        )
         self.target_ttft_ms = getattr(config, "scheduler_target_ttft_ms", 200.0)
         self.target_tpot_ms = getattr(config, "scheduler_target_tpot_ms", 50.0)
         self.slo_prefill_priority_threshold = getattr(
@@ -227,6 +269,20 @@ class Scheduler:
         self.slo_infeasible_budget_steps = 0
         self.slo_throughput_priority_steps = 0
         self.last_slo_decision = None
+        self.hybrid_scheduler_admission_decisions = 0
+        self.hybrid_scheduler_reorders = 0
+        self.hybrid_scheduler_aging_overrides = 0
+        self.hybrid_scheduler_candidates_probed = 0
+        self.hybrid_scheduler_estimated_saved_prefill_tokens = 0
+        self.hybrid_scheduler_selected_reusable_tokens = 0
+        self.hybrid_scheduler_probe_ms = 0.0
+        self.hybrid_scheduler_max_observed_wait_ms = 0.0
+        self.recompute_aware_preemptions = 0
+        self.recompute_aware_reclaimed_blocks = 0
+        self.recompute_aware_estimated_recompute_tokens = 0
+        self.recompute_aware_avoided_recompute_tokens = 0
+        self.recompute_aware_selection_ms = 0.0
+        self.last_hybrid_scheduler_decision = None
         if self.hybrid_prefix_coordinator is not None:
             self.hybrid_prefix_coordinator.reset_metrics()
 
@@ -255,6 +311,44 @@ class Scheduler:
             "slo_infeasible_budget_steps": self.slo_infeasible_budget_steps,
             "slo_throughput_priority_steps": self.slo_throughput_priority_steps,
             "last_slo_decision": self.last_slo_decision,
+            "waiting_admission_policy": self.waiting_admission_policy,
+            "preemption_policy": self.preemption_policy,
+            "hybrid_scheduler_admission_decisions": (
+                self.hybrid_scheduler_admission_decisions
+            ),
+            "hybrid_scheduler_reorders": self.hybrid_scheduler_reorders,
+            "hybrid_scheduler_aging_overrides": (
+                self.hybrid_scheduler_aging_overrides
+            ),
+            "hybrid_scheduler_candidates_probed": (
+                self.hybrid_scheduler_candidates_probed
+            ),
+            "hybrid_scheduler_estimated_saved_prefill_tokens": (
+                self.hybrid_scheduler_estimated_saved_prefill_tokens
+            ),
+            "hybrid_scheduler_selected_reusable_tokens": (
+                self.hybrid_scheduler_selected_reusable_tokens
+            ),
+            "hybrid_scheduler_probe_ms": self.hybrid_scheduler_probe_ms,
+            "hybrid_scheduler_max_observed_wait_ms": (
+                self.hybrid_scheduler_max_observed_wait_ms
+            ),
+            "recompute_aware_preemptions": self.recompute_aware_preemptions,
+            "recompute_aware_reclaimed_blocks": (
+                self.recompute_aware_reclaimed_blocks
+            ),
+            "recompute_aware_estimated_recompute_tokens": (
+                self.recompute_aware_estimated_recompute_tokens
+            ),
+            "recompute_aware_avoided_recompute_tokens": (
+                self.recompute_aware_avoided_recompute_tokens
+            ),
+            "recompute_aware_selection_ms": (
+                self.recompute_aware_selection_ms
+            ),
+            "last_hybrid_scheduler_decision": (
+                self.last_hybrid_scheduler_decision
+            ),
             "prefill_ms_per_token_ewma": self.prefill_ms_per_token_ewma,
             "prefill_base_ms": self.prefill_base_ms,
             "decode_step_ms_ewma": self.decode_step_ms_ewma,
@@ -527,6 +621,236 @@ class Scheduler:
             "kv_pressure": self._kv_pressure(),
         }
 
+    def _probe_prefix(
+        self,
+        seq: Sequence,
+        *,
+        durable_only: bool = False,
+    ) -> tuple[int, int, bool]:
+        """Return reusable tokens, KV-only tokens, and allocation feasibility."""
+        if seq.block_table and not durable_only:
+            return seq.num_cached_tokens, seq.num_cached_tokens, True
+        if self.enable_hybrid_prefix_cache:
+            probe = self.hybrid_prefix_coordinator.probe(seq)
+            candidate = probe.candidate
+            feasible = self.full_attention_prefix_manager.can_allocate(
+                seq, candidate
+            )
+            if (
+                self.state_manager is not None
+                and seq.state_slot is None
+                and not self.state_manager.can_allocate
+            ):
+                feasible = False
+            return (
+                probe.boundary_tokens,
+                probe.kv_candidate_tokens,
+                feasible,
+            )
+        if not self.enable_prefix_cache:
+            return (
+                0,
+                0,
+                len(self.block_manager.free_block_ids) >= seq.num_blocks,
+            )
+        candidates = self.block_manager.find_prefix_candidates(seq)
+        candidate = candidates[0] if candidates else None
+        reusable_tokens = candidate.boundary_tokens if candidate else 0
+        feasible = self.block_manager.can_allocate_candidate(seq, candidate)
+        if (
+            self.state_manager is not None
+            and seq.state_slot is None
+            and not self.state_manager.can_allocate
+        ):
+            feasible = False
+        return reusable_tokens, reusable_tokens, feasible
+
+    def _admission_probe(
+        self,
+        seq: Sequence,
+        queue_index: int,
+        now_ns: int,
+    ) -> AdmissionProbe:
+        reusable, kv_candidate, feasible = self._probe_prefix(seq)
+        uncached = max(seq.num_tokens - reusable, 0)
+        age_ms = max((now_ns - seq.arrival_time_ns) / 1e6, 0.0)
+        score = (
+            uncached
+            - self.hybrid_scheduler_aging_tokens_per_ms * age_ms
+        )
+        return AdmissionProbe(
+            sequence=seq,
+            queue_index=queue_index,
+            reusable_tokens=reusable,
+            kv_candidate_tokens=kv_candidate,
+            uncached_tokens=uncached,
+            age_ms=age_ms,
+            score=score,
+            feasible=feasible,
+        )
+
+    def _select_waiting_candidate(
+        self,
+        now_ns: int | None = None,
+    ) -> Sequence:
+        if not self.waiting:
+            raise RuntimeError("cannot select from an empty waiting queue")
+        if self.waiting_admission_policy == "fcfs":
+            return self.waiting[0]
+        head = self.waiting[0]
+        # Continue requests that already own resources, and recover preempted
+        # work before reordering new admissions.
+        if head.block_table or head.preemption_count:
+            return head
+        now_ns = now_ns if now_ns is not None else perf_counter_ns()
+        started = perf_counter_ns()
+        window = list(self.waiting)[: self.hybrid_scheduler_candidate_window]
+        probes = [
+            self._admission_probe(seq, index, now_ns)
+            for index, seq in enumerate(window)
+        ]
+        self.hybrid_scheduler_candidates_probed += len(probes)
+        self.hybrid_scheduler_admission_decisions += 1
+        self.hybrid_scheduler_max_observed_wait_ms = max(
+            self.hybrid_scheduler_max_observed_wait_ms,
+            max(probe.age_ms for probe in probes),
+        )
+        feasible = [probe for probe in probes if probe.feasible]
+        if not feasible:
+            chosen = probes[0]
+            reason = "no_feasible_candidate"
+        else:
+            minimum_work = min(
+                feasible,
+                key=lambda probe: (
+                    probe.score,
+                    probe.sequence.arrival_time_ns,
+                    probe.sequence.seq_id,
+                ),
+            )
+            overdue = [
+                probe
+                for probe in feasible
+                if probe.age_ms >= self.hybrid_scheduler_max_wait_ms
+            ]
+            if overdue:
+                chosen = min(
+                    overdue,
+                    key=lambda probe: (
+                        probe.sequence.arrival_time_ns,
+                        probe.sequence.seq_id,
+                    ),
+                )
+                reason = "aging_deadline"
+                if chosen.sequence is not minimum_work.sequence:
+                    self.hybrid_scheduler_aging_overrides += 1
+            else:
+                chosen = minimum_work
+                reason = "minimum_effective_prefill"
+                head_probe = probes[0]
+                saved = head_probe.uncached_tokens - chosen.uncached_tokens
+                if (
+                    chosen.queue_index
+                    and head_probe.feasible
+                    and saved < self.hybrid_scheduler_min_saved_tokens
+                ):
+                    chosen = head_probe
+                    reason = "benefit_below_hysteresis"
+
+        # Only requests jumped over by the selected candidate were bypassed.
+        # Requests behind the selected position merely retain normal queue order.
+        for probe in probes:
+            if probe.queue_index < chosen.queue_index:
+                probe.sequence.mark_bypassed()
+        chosen.sequence.last_scheduler_score = chosen.score
+        chosen.sequence.last_reusable_tokens = chosen.reusable_tokens
+        if chosen.queue_index:
+            self.waiting.remove(chosen.sequence)
+            self.waiting.appendleft(chosen.sequence)
+            self.hybrid_scheduler_reorders += 1
+        head_uncached = probes[0].uncached_tokens
+        self.hybrid_scheduler_estimated_saved_prefill_tokens += max(
+            head_uncached - chosen.uncached_tokens,
+            0,
+        )
+        self.hybrid_scheduler_selected_reusable_tokens += (
+            chosen.reusable_tokens
+        )
+        self.hybrid_scheduler_probe_ms += (
+            perf_counter_ns() - started
+        ) / 1e6
+        self.last_hybrid_scheduler_decision = {
+            "reason": reason,
+            "selected_request_id": chosen.sequence.seq_id,
+            "queue_index": chosen.queue_index,
+            "reusable_tokens": chosen.reusable_tokens,
+            "kv_candidate_tokens": chosen.kv_candidate_tokens,
+            "uncached_tokens": chosen.uncached_tokens,
+            "age_ms": chosen.age_ms,
+            "score": chosen.score,
+            "window": len(probes),
+        }
+        return chosen.sequence
+
+    def _preemption_probe(self, seq: Sequence) -> PreemptionProbe:
+        reusable, _, _ = self._probe_prefix(seq, durable_only=True)
+        reclaimable = self.block_manager.reclaimable_blocks(seq)
+        recompute = max(seq.num_cached_tokens - reusable, 0)
+        if reclaimable:
+            cost = (
+                recompute / reclaimable
+                + self.hybrid_scheduler_preemption_penalty
+                * seq.preemption_count
+            )
+        else:
+            cost = float("inf")
+        return PreemptionProbe(
+            sequence=seq,
+            reclaimable_blocks=reclaimable,
+            reusable_tokens=reusable,
+            recompute_tokens=recompute,
+            cost_per_block=cost,
+        )
+
+    def _select_preemption_victim(
+        self,
+        current: Sequence,
+    ) -> PreemptionProbe:
+        candidates = [*self.running, current]
+        if self.preemption_policy == "lifo":
+            return self._preemption_probe(
+                self.running[-1] if self.running else current
+            )
+        started = perf_counter_ns()
+        probes = [self._preemption_probe(seq) for seq in candidates]
+        chosen = min(
+            probes,
+            key=lambda probe: (
+                probe.cost_per_block,
+                -probe.reclaimable_blocks,
+                probe.sequence.seq_id,
+            ),
+        )
+        baseline = self._preemption_probe(
+            self.running[-1] if self.running else current
+        )
+        self.recompute_aware_preemptions += 1
+        self.recompute_aware_reclaimed_blocks += chosen.reclaimable_blocks
+        self.recompute_aware_estimated_recompute_tokens += (
+            chosen.recompute_tokens
+        )
+        self.recompute_aware_avoided_recompute_tokens += max(
+            baseline.recompute_tokens - chosen.recompute_tokens,
+            0,
+        )
+        self.recompute_aware_selection_ms += (
+            perf_counter_ns() - started
+        ) / 1e6
+        chosen.sequence.estimated_recompute_tokens_lost += (
+            chosen.recompute_tokens
+        )
+        return chosen
+
     def _schedule_prefill(
         self, token_budget: int, sequence_budget: int
     ) -> list[Sequence]:
@@ -534,12 +858,12 @@ class Scheduler:
         num_batched_tokens = 0
 
         while self.waiting and len(scheduled_seqs) < sequence_budget:
-            seq = self.waiting[0]
-            hybrid_prefix_hit = None
-            plan = None
             remaining = token_budget - num_batched_tokens
             if remaining == 0:
                 break
+            seq = self._select_waiting_candidate()
+            hybrid_prefix_hit = None
+            plan = None
             if not seq.block_table:
                 if self.enable_hybrid_prefix_cache:
                     self.prefix_cache_queries += 1
@@ -663,11 +987,13 @@ class Scheduler:
                 return self.block_manager.can_append(seq)
 
             while not has_capacity():
-                if self.running:
-                    self.preempt(self.running.pop())
-                else:
+                victim_probe = self._select_preemption_victim(seq)
+                victim = victim_probe.sequence
+                if victim is seq:
                     self.preempt(seq)
                     break
+                self.running.remove(victim)
+                self.preempt(victim)
             else:
                 seq.num_scheduled_tokens = 1
                 seq.is_prefill = False

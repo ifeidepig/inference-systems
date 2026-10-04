@@ -374,6 +374,13 @@ class BlockManager:
         seq.num_cached_tokens = 0
         seq.block_table.clear()
 
+    def reclaimable_blocks(self, seq: Sequence) -> int:
+        """Physical blocks that become free if this request releases refs."""
+        return sum(
+            self.blocks[block_id].ref_count == 1
+            for block_id in set(seq.block_table)
+        )
+
     def can_append(self, seq: Sequence) -> bool:
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
 

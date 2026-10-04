@@ -555,8 +555,9 @@ class HybridPrefixCoordinator:
 
     def plan(self, sequence) -> HybridPrefixAllocationPlan | None:
         candidates = self.full_attention.find_candidates(sequence)
-        hit = self.gdn_checkpoints.peek_hit(candidates)
-        num_cached_blocks = hit.candidate.num_cached_blocks if hit else 0
+        probe = self._probe_from_candidates(candidates)
+        hit = probe.hit
+        num_cached_blocks = probe.num_cached_blocks
         if not self.full_attention.can_allocate(sequence, hit.candidate if hit else None):
             return None
         committed_boundary = hit.candidate.boundary_tokens if hit else 0
@@ -570,8 +571,33 @@ class HybridPrefixCoordinator:
         return HybridPrefixAllocationPlan(
             hit,
             num_cached_blocks,
-            candidates[0].boundary_tokens if candidates else 0,
+            probe.kv_candidate_tokens,
             promotion_candidate,
+        )
+
+    def probe(self, sequence) -> HybridPrefixAllocationPlan:
+        """Read-only KV/GDN intersection for scheduler scoring.
+
+        This method does not allocate blocks, update LRU/hit metrics, observe
+        demand, or publish promotion metadata.
+        """
+        return self._probe_from_candidates(
+            self.full_attention.find_candidates(sequence)
+        )
+
+    def _probe_from_candidates(
+        self,
+        candidates: list[PrefixKVCandidate],
+    ) -> HybridPrefixAllocationPlan:
+        hit = self.gdn_checkpoints.peek_hit(candidates)
+        return HybridPrefixAllocationPlan(
+            hit=hit,
+            num_cached_blocks=(
+                hit.candidate.num_cached_blocks if hit is not None else 0
+            ),
+            kv_candidate_tokens=(
+                candidates[0].boundary_tokens if candidates else 0
+            ),
         )
 
     def commit(self, plan: HybridPrefixAllocationPlan) -> None:

@@ -261,6 +261,31 @@ def parse_args() -> argparse.Namespace:
         choices=("prefill_first", "decode_first", "slo_aware"),
         default="decode_first",
     )
+    parser.add_argument(
+        "--waiting-admission-policy",
+        choices=("fcfs", "hybrid_state_aware"),
+        default="fcfs",
+    )
+    parser.add_argument(
+        "--preemption-policy",
+        choices=("lifo", "recompute_aware"),
+        default="lifo",
+    )
+    parser.add_argument(
+        "--hybrid-scheduler-candidate-window", type=int, default=8
+    )
+    parser.add_argument(
+        "--hybrid-scheduler-aging-tokens-per-ms", type=float, default=0.5
+    )
+    parser.add_argument(
+        "--hybrid-scheduler-max-wait-ms", type=float, default=200.0
+    )
+    parser.add_argument(
+        "--hybrid-scheduler-min-saved-tokens", type=int, default=16
+    )
+    parser.add_argument(
+        "--hybrid-scheduler-preemption-penalty", type=float, default=128.0
+    )
     parser.add_argument("--target-ttft-ms", type=float, default=200.0)
     parser.add_argument("--target-tpot-ms", type=float, default=50.0)
     parser.add_argument("--slo-min-prefill-tokens", type=int, default=64)
@@ -353,6 +378,23 @@ def main() -> None:
         max_num_batched_tokens=args.max_num_batched_tokens,
         max_num_seqs=args.max_num_seqs,
         scheduling_policy=args.scheduling_policy,
+        waiting_admission_policy=args.waiting_admission_policy,
+        preemption_policy=args.preemption_policy,
+        hybrid_scheduler_candidate_window=(
+            args.hybrid_scheduler_candidate_window
+        ),
+        hybrid_scheduler_aging_tokens_per_ms=(
+            args.hybrid_scheduler_aging_tokens_per_ms
+        ),
+        hybrid_scheduler_max_wait_ms=(
+            args.hybrid_scheduler_max_wait_ms
+        ),
+        hybrid_scheduler_min_saved_tokens=(
+            args.hybrid_scheduler_min_saved_tokens
+        ),
+        hybrid_scheduler_preemption_penalty=(
+            args.hybrid_scheduler_preemption_penalty
+        ),
         scheduler_target_ttft_ms=args.target_ttft_ms,
         scheduler_target_tpot_ms=args.target_tpot_ms,
         slo_min_prefill_tokens=args.slo_min_prefill_tokens,

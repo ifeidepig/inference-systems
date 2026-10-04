@@ -5,6 +5,7 @@ from benchmark_online import (
     build_prompt,
     generate_arrival_offsets,
     generate_workload,
+    output_digest,
     prompt_class,
     summarize_requests,
 )
@@ -29,6 +30,10 @@ class ArrivalPatternTest(unittest.TestCase):
 
 
 class WorkloadTest(unittest.TestCase):
+
+    def test_output_digest_is_order_sensitive_and_reproducible(self):
+        self.assertEqual(output_digest([[1, 2], [3]]), output_digest([[1, 2], [3]]))
+        self.assertNotEqual(output_digest([[1, 2], [3]]), output_digest([[3], [1, 2]]))
 
     def test_workload_generation_is_reproducible(self):
         kwargs = dict(

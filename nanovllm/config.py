@@ -15,6 +15,13 @@ class Config:
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
     scheduling_policy: str = "prefill_first"
+    waiting_admission_policy: str = "fcfs"
+    preemption_policy: str = "lifo"
+    hybrid_scheduler_candidate_window: int = 8
+    hybrid_scheduler_aging_tokens_per_ms: float = 0.5
+    hybrid_scheduler_max_wait_ms: float = 200.0
+    hybrid_scheduler_min_saved_tokens: int = 16
+    hybrid_scheduler_preemption_penalty: float = 128.0
     scheduler_target_ttft_ms: float = 200.0
     scheduler_target_tpot_ms: float = 50.0
     slo_prefill_priority_threshold: float = 0.8
@@ -67,6 +74,23 @@ class Config:
             "decode_first",
             "slo_aware",
         )
+        if self.waiting_admission_policy not in (
+            "fcfs",
+            "hybrid_state_aware",
+        ):
+            raise ValueError("unsupported waiting admission policy")
+        if self.preemption_policy not in ("lifo", "recompute_aware"):
+            raise ValueError("unsupported preemption policy")
+        if self.hybrid_scheduler_candidate_window <= 0:
+            raise ValueError("candidate window must be positive")
+        if self.hybrid_scheduler_aging_tokens_per_ms < 0:
+            raise ValueError("aging factor must be non-negative")
+        if self.hybrid_scheduler_max_wait_ms <= 0:
+            raise ValueError("maximum wait must be positive")
+        if self.hybrid_scheduler_min_saved_tokens < 0:
+            raise ValueError("minimum saved tokens must be non-negative")
+        if self.hybrid_scheduler_preemption_penalty < 0:
+            raise ValueError("preemption penalty must be non-negative")
         assert self.scheduler_target_ttft_ms > 0
         assert self.scheduler_target_tpot_ms > 0
         assert self.slo_prefill_priority_threshold > 0

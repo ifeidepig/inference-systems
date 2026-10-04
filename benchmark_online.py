@@ -1,6 +1,7 @@
 """Replay dynamic request arrivals against nano-vLLM."""
 
 import argparse
+import hashlib
 import json
 import random
 import time
@@ -123,6 +124,11 @@ def prompt_class(prompt_tokens: int) -> str:
     return "long"
 
 
+def output_digest(token_ids_by_request: list[list[int]]) -> str:
+    payload = json.dumps(token_ids_by_request, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def summarize_requests(
     requests: list[dict], target_ttft_ms: float, target_tpot_ms: float
 ) -> dict:
@@ -182,7 +188,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--shared-prefix-ratio", type=float, default=0.0)
     parser.add_argument("--shared-prefix-groups", type=int, default=2)
     parser.add_argument("--shared-prefix-length", type=int, default=512)
+    parser.add_argument(
+        "--prefix-seed-requests",
+        type=int,
+        default=0,
+        help=(
+            "Warm each shared-prefix group with this many requests before "
+            "metrics reset; use 2 for second-sighting hybrid promotion."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--target-ttft-ms", type=float, default=200.0)
     parser.add_argument("--target-tpot-ms", type=float, default=50.0)
     parser.add_argument("--max-model-len", type=int, default=1024)
@@ -194,25 +210,86 @@ def parse_args() -> argparse.Namespace:
         choices=("prefill_first", "decode_first", "slo_aware"),
         default="decode_first",
     )
+    parser.add_argument(
+        "--waiting-admission-policy",
+        choices=("fcfs", "hybrid_state_aware"),
+        default="fcfs",
+    )
+    parser.add_argument(
+        "--preemption-policy",
+        choices=("lifo", "recompute_aware"),
+        default="lifo",
+    )
+    parser.add_argument("--hybrid-scheduler-candidate-window", type=int, default=8)
+    parser.add_argument(
+        "--hybrid-scheduler-aging-tokens-per-ms", type=float, default=0.5
+    )
+    parser.add_argument("--hybrid-scheduler-max-wait-ms", type=float, default=200.0)
+    parser.add_argument("--hybrid-scheduler-min-saved-tokens", type=int, default=16)
+    parser.add_argument(
+        "--hybrid-scheduler-preemption-penalty", type=float, default=128.0
+    )
     parser.add_argument("--slo-min-prefill-tokens", type=int, default=64)
     parser.add_argument("--slo-kv-pressure-threshold", type=float, default=0.9)
     parser.add_argument("--slo-queue-pressure-threshold", type=int, default=3)
     parser.add_argument("--slo-latency-safety-margin-ms", type=float, default=5.0)
     parser.add_argument("--use-cuda-graph", action="store_true")
+    parser.add_argument("--max-num-kvcache-blocks", type=int, default=None)
+    parser.add_argument("--prefix-match-unit", type=int, default=256)
     parser.add_argument("--disable-prefix-cache", action="store_true")
     parser.add_argument("--disable-chunked-prefill", action="store_true")
+    parser.add_argument("--enable-hybrid-prefix-cache", action="store_true")
+    parser.add_argument("--hybrid-prefix-checkpoint-memory-mib", type=int, default=128)
+    parser.add_argument(
+        "--hybrid-prefix-checkpoint-dtype",
+        choices=("fp32", "bf16", "int8"),
+        default="bf16",
+    )
+    parser.add_argument(
+        "--hybrid-prefix-checkpoint-interval-tokens", type=int, default=256
+    )
+    parser.add_argument(
+        "--hybrid-prefix-retention-policy",
+        choices=("periodic", "adaptive"),
+        default="adaptive",
+    )
+    parser.add_argument(
+        "--hybrid-prefix-eviction-policy",
+        choices=("lru", "cost_aware"),
+        default="cost_aware",
+    )
+    parser.add_argument(
+        "--gdn-decode-backend",
+        choices=("torch", "cuda", "auto"),
+        default="auto",
+    )
     return parser.parse_args()
 
 
 def validate_args(args: argparse.Namespace) -> None:
     if args.target_ttft_ms <= 0 or args.target_tpot_ms <= 0:
         raise ValueError("SLO targets must be positive")
+    if args.temperature < 0:
+        raise ValueError("temperature cannot be negative")
     if args.shared_prefix_length < 0:
         raise ValueError("shared prefix length cannot be negative")
+    if args.prefix_seed_requests < 0:
+        raise ValueError("prefix seed request count cannot be negative")
     if min(args.output_lengths) < 2:
         raise ValueError("online SLO measurement requires at least two output tokens")
     if max(args.prompt_lengths) + max(args.output_lengths) > args.max_model_len:
         raise ValueError("a configured request shape exceeds --max-model-len")
+    if 256 % args.prefix_match_unit:
+        raise ValueError("prefix match unit must divide the 256-token KV page")
+    if args.hybrid_scheduler_candidate_window <= 0:
+        raise ValueError("candidate window must be positive")
+    if args.enable_hybrid_prefix_cache and args.disable_prefix_cache:
+        raise ValueError("hybrid prefix cache requires prefix caching")
+    if (
+        args.enable_hybrid_prefix_cache
+        and args.hybrid_prefix_checkpoint_memory_mib <= 0
+    ):
+        raise ValueError("hybrid checkpoint memory must be positive")
 
 
 def main() -> None:
@@ -237,7 +314,24 @@ def main() -> None:
         max_model_len=args.max_model_len,
         max_num_batched_tokens=args.max_num_batched_tokens,
         max_num_seqs=args.max_num_seqs,
+        max_num_state_slots=args.max_num_seqs,
+        max_num_kvcache_blocks=args.max_num_kvcache_blocks,
         scheduling_policy=args.scheduling_policy,
+        waiting_admission_policy=args.waiting_admission_policy,
+        preemption_policy=args.preemption_policy,
+        hybrid_scheduler_candidate_window=(
+            args.hybrid_scheduler_candidate_window
+        ),
+        hybrid_scheduler_aging_tokens_per_ms=(
+            args.hybrid_scheduler_aging_tokens_per_ms
+        ),
+        hybrid_scheduler_max_wait_ms=args.hybrid_scheduler_max_wait_ms,
+        hybrid_scheduler_min_saved_tokens=(
+            args.hybrid_scheduler_min_saved_tokens
+        ),
+        hybrid_scheduler_preemption_penalty=(
+            args.hybrid_scheduler_preemption_penalty
+        ),
         scheduler_target_ttft_ms=args.target_ttft_ms,
         scheduler_target_tpot_ms=args.target_tpot_ms,
         slo_min_prefill_tokens=args.slo_min_prefill_tokens,
@@ -246,6 +340,24 @@ def main() -> None:
         slo_latency_safety_margin_ms=args.slo_latency_safety_margin_ms,
         enable_prefix_cache=not args.disable_prefix_cache,
         enable_chunked_prefill=not args.disable_chunked_prefill,
+        prefix_match_unit=args.prefix_match_unit,
+        enable_hybrid_prefix_cache=args.enable_hybrid_prefix_cache,
+        hybrid_prefix_checkpoint_interval_tokens=(
+            args.hybrid_prefix_checkpoint_interval_tokens
+        ),
+        hybrid_prefix_checkpoint_memory_bytes=(
+            args.hybrid_prefix_checkpoint_memory_mib * 1024 * 1024
+            if args.enable_hybrid_prefix_cache
+            else 0
+        ),
+        hybrid_prefix_checkpoint_dtype=(
+            args.hybrid_prefix_checkpoint_dtype
+        ),
+        hybrid_prefix_retention_policy=(
+            args.hybrid_prefix_retention_policy
+        ),
+        hybrid_prefix_eviction_policy=args.hybrid_prefix_eviction_policy,
+        gdn_decode_backend=args.gdn_decode_backend,
         request_metrics_history_size=max(args.num_requests, 1),
     )
     candidate_ids = llm.tokenizer.encode(" benchmark", add_special_tokens=False)
@@ -262,9 +374,43 @@ def main() -> None:
         )
         llm.generate(
             [warmup],
-            SamplingParams(temperature=0.1, max_tokens=2, ignore_eos=True),
+            SamplingParams(
+                temperature=args.temperature,
+                max_tokens=2,
+                ignore_eos=True,
+            ),
             use_tqdm=False,
         )
+    if args.prefix_seed_requests:
+        seed_prompt_length = max(args.prompt_lengths)
+        for group in range(args.shared_prefix_groups):
+            for seed_index in range(args.prefix_seed_requests):
+                seed_spec = RequestSpec(
+                    request_index=(
+                        args.num_requests + group * args.prefix_seed_requests
+                        + seed_index
+                    ),
+                    arrival_offset_ms=0.0,
+                    prompt_length=seed_prompt_length,
+                    output_length=2,
+                    shared_prefix_group=group,
+                )
+                llm.generate(
+                    [
+                        build_prompt(
+                            seed_spec,
+                            base_token_id,
+                            vocab_size,
+                            args.shared_prefix_length,
+                        )
+                    ],
+                    SamplingParams(
+                        temperature=args.temperature,
+                        max_tokens=2,
+                        ignore_eos=True,
+                    ),
+                    use_tqdm=False,
+                )
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
     llm.reset_runtime_metrics()
@@ -274,6 +420,7 @@ def main() -> None:
     sequences = {}
     specs_by_request_id = {}
     trace = []
+    finished_outputs = {}
     peak_waiting = peak_running = peak_kv_blocks = 0
 
     while next_request < len(workload) or not llm.is_finished():
@@ -289,7 +436,7 @@ def main() -> None:
             request_id = llm.add_request(
                 prompt,
                 SamplingParams(
-                    temperature=0.1,
+                    temperature=args.temperature,
                     max_tokens=spec.output_length,
                     ignore_eos=True,
                 ),
@@ -309,7 +456,8 @@ def main() -> None:
 
         if not llm.is_finished():
             step_started_ns = perf_counter_ns()
-            _, stats = llm.step()
+            outputs, stats = llm.step()
+            finished_outputs.update(dict(outputs))
             torch.cuda.synchronize()
             step_finished_ns = perf_counter_ns()
             trace.append(
@@ -371,6 +519,13 @@ def main() -> None:
 
     duration_s = (benchmark_finished_ns - benchmark_started_ns) / 1e9
     total_output_tokens = sum(request["output_tokens"] for request in requests)
+    ordered_output_tokens = [
+        finished_outputs[request_id]
+        for request_id, _ in sorted(
+            specs_by_request_id.items(),
+            key=lambda item: item[1].request_index,
+        )
+    ]
     result = {
         "config": vars(args) | {
             "model": str(args.model),
@@ -396,6 +551,8 @@ def main() -> None:
         "runtime_metrics": llm.get_runtime_metrics(),
         "workload": [asdict(spec) for spec in workload],
         "requests": requests,
+        "output_token_ids": ordered_output_tokens,
+        "output_digest": output_digest(ordered_output_tokens),
         "trace": trace,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)

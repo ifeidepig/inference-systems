@@ -53,6 +53,12 @@ class Sequence:
         self.token_timestamps_ns: list[int] = []
         self.schedule_count = 0
         self.preemption_count = 0
+        self.wait_rounds = 0
+        self.max_wait_rounds = 0
+        self.scheduler_bypass_count = 0
+        self.last_scheduler_score: float | None = None
+        self.last_reusable_tokens = 0
+        self.estimated_recompute_tokens_lost = 0
         self.prefix_cache_hit_blocks = 0
         self.peak_kv_blocks = 0
 
@@ -98,10 +104,16 @@ class Sequence:
             self.first_scheduled_time_ns = scheduled_at_ns
         self.last_scheduled_time_ns = scheduled_at_ns
         self.schedule_count += 1
+        self.wait_rounds = 0
         self.peak_kv_blocks = max(self.peak_kv_blocks, len(self.block_table))
 
     def mark_preempted(self) -> None:
         self.preemption_count += 1
+
+    def mark_bypassed(self) -> None:
+        self.wait_rounds += 1
+        self.max_wait_rounds = max(self.max_wait_rounds, self.wait_rounds)
+        self.scheduler_bypass_count += 1
 
     def append_token(
         self, token_id: int, generated_at_ns: int | None = None
@@ -165,6 +177,12 @@ class Sequence:
             ),
             "schedule_count": self.schedule_count,
             "preemption_count": self.preemption_count,
+            "scheduler_bypass_count": self.scheduler_bypass_count,
+            "max_wait_rounds": self.max_wait_rounds,
+            "last_reusable_tokens": self.last_reusable_tokens,
+            "estimated_recompute_tokens_lost": (
+                self.estimated_recompute_tokens_lost
+            ),
             "prefix_cache_hit_blocks": self.prefix_cache_hit_blocks,
             "peak_kv_blocks": self.peak_kv_blocks,
         }

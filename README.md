@@ -185,6 +185,14 @@ bottleneck at batch 2, so ReplaySSM is not recommended yet. See
 
 The SLO-aware scheduler improved the measured token-SLO violation rate from 29.17% to 16.67% on the recorded Qwen3-0.6B Poisson workload, with a 0.53% throughput reduction. The burst workload remained a negative case. Workload definitions and evidence boundaries are in [docs/slo-scheduler.md](docs/slo-scheduler.md) and [docs/online-workload.md](docs/online-workload.md).
 
+An opt-in Hybrid State-Aware policy adds bounded Top-W, side-effect-free
+KV/GDN joint-prefix admission with aging/hysteresis, plus recompute-aware
+preemption based on durable recovery tokens per actually reclaimable physical
+KV page. Defaults remain FCFS/LIFO. Deterministic shared-prefix, multi-session,
+unique-prompt, KV-pressure and multi-turn control-plane traces, the GPU A/B
+harness, metrics and evidence limits are documented in
+[docs/hybrid-state-aware-scheduler.md](docs/hybrid-state-aware-scheduler.md).
+
 ## Installation
 
 ```bash

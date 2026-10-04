@@ -265,6 +265,59 @@ def test_coordinator_plans_longest_jointly_restorable_prefix():
         Sequence.block_size = old_block_size
 
 
+def test_coordinator_probe_is_side_effect_free():
+    old_block_size = Sequence.block_size
+    Sequence.block_size = 4
+    try:
+        blocks = BlockManager(num_blocks=8, block_size=4)
+        source = Sequence(
+            list(range(9)),
+            SamplingParams(temperature=0.0, max_tokens=1),
+        )
+        blocks.allocate(source, num_cached_blocks=0)
+        source.num_scheduled_tokens = 8
+        blocks.hash_blocks(source)
+        boundary = blocks.prefix_metadata_at_boundary(source, 4)
+        blocks.deallocate(source)
+        checkpoints = GDNCheckpointManager(capacity=2)
+        checkpoints.publish(
+            PendingHybridPrefixCapture(
+                boundary.prefix_hash,
+                boundary.boundary_tokens,
+                boundary.tail_block_id,
+                state_slot=0,
+            ),
+            checkpoint_slot=0,
+        )
+        coordinator = HybridPrefixCoordinator(
+            FullAttentionPrefixManager(blocks),
+            checkpoints,
+            promote_shared_junctions=True,
+        )
+        incoming = Sequence(
+            list(range(8)) + [99],
+            SamplingParams(temperature=0.0, max_tokens=1),
+        )
+        metrics_before = coordinator.get_metrics().copy()
+        demands_before = dict(coordinator.demands)
+        lru_before = list(checkpoints.lru)
+        entry = checkpoints.entries[
+            (boundary.prefix_hash, boundary.boundary_tokens)
+        ]
+        hit_count_before = entry.hit_count
+
+        probe = coordinator.probe(incoming)
+
+        assert probe.boundary_tokens == 4
+        assert probe.kv_candidate_tokens == 8
+        assert coordinator.get_metrics() == metrics_before
+        assert dict(coordinator.demands) == demands_before
+        assert list(checkpoints.lru) == lru_before
+        assert entry.hit_count == hit_count_before
+    finally:
+        Sequence.block_size = old_block_size
+
+
 def test_coordinator_returns_cold_plan_when_only_kv_is_resident():
     old_block_size = Sequence.block_size
     Sequence.block_size = 4
