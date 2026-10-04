@@ -8,6 +8,8 @@ from nanovllm.engine.speculative import (
     build_greedy_commit_plan,
     greedy_verify,
 )
+from nanovllm.engine.model_runner import ModelRunner
+from nanovllm.engine.phase_profiler import PhaseProfiler
 from nanovllm.engine.state_manager import HybridStateManager
 from nanovllm.models.qwen3_5_mtp import Qwen3_5MTP
 from nanovllm.models.registry import create_model, normalize_hf_config
@@ -93,6 +95,36 @@ def test_mtp_head_uses_shared_embedding_and_produces_hidden_states():
         reset_context()
         if owns_group:
             dist.destroy_process_group()
+
+
+def test_mtp_alignment_can_skip_unused_lm_head():
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.enforce_eager = True
+    runner.mtp_phase_profiler = PhaseProfiler(False)
+    runner._set_offset_decode_context = lambda *args, **kwargs: None
+    runner.mtp = lambda input_ids, positions, hidden, cu: hidden + 1
+
+    class Model:
+        @staticmethod
+        def compute_logits(hidden):
+            raise AssertionError("final alignment must not project logits")
+
+    runner.model = Model()
+    hidden = torch.zeros(2, 4)
+    set_context(False, cu_seqlens_q=torch.tensor([0, 1, 2]))
+    try:
+        output, logits = runner._mtp_step(
+            [],
+            torch.tensor([1, 2]),
+            torch.tensor([3, 4]),
+            hidden,
+            compute_logits=False,
+        )
+    finally:
+        reset_context()
+
+    assert logits is None
+    assert torch.equal(output, hidden + 1)
 
 
 def test_greedy_verification_handles_different_accept_lengths():

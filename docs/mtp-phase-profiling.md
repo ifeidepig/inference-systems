@@ -2,7 +2,8 @@
 
 ## Scope
 
-This study profiles the current correctness-first native MTP-2 implementation.
+This study first profiles the pre-optimization correctness-first native MTP-2
+implementation, then records the 2026-10-05 follow-up implementation and A/B.
 It does not implement ReplaySSM, change the recurrence, alter the workload, or
 remove full recurrent/conv state history.
 
@@ -35,16 +36,16 @@ Scheduler KV reservation (N_draft + 1)
 -> packed verify input [base, proposal_0]
 -> parallel target verify + recurrent/conv history
 -> greedy accept/reject
--> select accepted recurrent/conv boundary and scatter
+-> keep final active GDN state or selectively roll back an earlier boundary
 -> build emitted tokens/final pending token
--> extra MTP forward for shifted-KV alignment
+-> extra MTP-layer-only forward for shifted-KV alignment, without LM head
 -> Scheduler logical KV commit and tail-page reclaim
 ```
 
-The final alignment is a complete third MTP step and currently computes an LM
-head result that the caller discards. Rejected target KV rows are not copied
-back; logical lengths make them unreachable and complete tail pages are
-reclaimed.
+Before the follow-up optimization, final alignment was a complete third MTP
+step and computed an LM-head result that the caller discarded. Rejected target
+KV rows are not copied back; logical lengths make them unreachable and complete
+tail pages are reclaimed.
 
 ## End-to-end controlled result
 
@@ -242,6 +243,52 @@ Higher-priority measured opportunities are:
    one compact host transfer;
 3. remove repeated GPU-to-CPU position conversions from MTP context metadata;
 4. only then re-profile history before designing ReplaySSM.
+
+## Implemented follow-up: alignment projection removal and selective rollback
+
+On 2026-10-05 the first optimization above was implemented. `_mtp_step` now
+accepts `compute_logits=False`; final alignment still executes the MTP layer so
+its shifted KV cache is correct, but it no longer runs the discarded
+vocabulary projection. Draft steps continue to compute logits normally.
+
+The state commit path was also tightened without introducing a second active
+state pool. Parallel verify already leaves each request's active GDN slot at
+the final verify boundary. The runner now keeps that state in place whenever
+it is the selected boundary and gathers/scatters history only for requests
+that must roll back to an earlier boundary. This is deliberately not a raw
+pointer switch into the verify-history buffer: that buffer is graph-owned and
+reused on the next replay, while active request state must remain mutable and
+valid across decode, preemption, prefix capture, cancellation, and TP ranks.
+
+Same-machine before/after A/B, RTX 3060, official 0.8B BF16, batch 2,
+32 output tokens/request, CUDA Graph, fused CUDA GDN backend, five fresh
+engines per arm:
+
+| Metric | Before | After |
+| --- | ---: | ---: |
+| Target-only throughput median | 164.46 tok/s | 165.19 tok/s |
+| MTP-2 throughput median | 136.16 tok/s | 144.97 tok/s |
+| MTP vs target-only | -17.21% | -12.24% |
+| Token equality | exact, 5/5 | exact, 5/5 |
+
+The MTP median improved by 6.47% relative to the pre-change MTP path. This is
+still a negative result versus target-only and must not be presented as a
+general MTP speedup.
+
+One shape-matched phase-profile run measured:
+
+| Phase | Before | After, no rollback rows |
+| --- | ---: | ---: |
+| Final alignment LM head | 1.64 ms | removed |
+| Final alignment total | 2.37 ms | 0.71 ms |
+| State select | 0.49 ms | 0.14 ms |
+| State scatter | 0.58 ms | 0.05 ms |
+| Selected/scattered state bytes over 11 rounds | 410 MiB | 0 MiB |
+
+The no-rollback trace reused 22/22 active rows. A controlled two-request test
+also covers mixed boundaries in one batch: one request reuses the active final
+state while one request restores an earlier history row. Eager and CUDA Graph
+outputs remain identical to target-only greedy decoding.
 
 ## Tool boundary
 

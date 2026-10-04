@@ -434,6 +434,7 @@ def test_model_runner_mtp_matches_target_with_acceptance_and_rejection(tmp_path)
             max_num_kvcache_blocks=2,
             num_speculative_tokens=num_speculative_tokens,
             speculative_parallel_verify=parallel_verify,
+            gdn_decode_backend="torch",
         )
 
     expected, _ = _generate_tiny_greedy(
@@ -493,6 +494,8 @@ def test_model_runner_mtp_continuous_batch_commits_variable_acceptance(tmp_path)
             max_num_kvcache_blocks=4,
             num_speculative_tokens=num_speculative_tokens,
             speculative_parallel_verify=True,
+            gdn_decode_backend="torch",
+            enable_mtp_phase_profiling=True,
         )
 
     expected_a, _ = _generate_tiny_greedy(
@@ -553,6 +556,13 @@ def test_model_runner_mtp_continuous_batch_commits_variable_acceptance(tmp_path)
 
         assert outputs[0] == expected_a[1:4]
         assert outputs[1] == expected_b[1:3]
+        phase_profile = runner.get_metrics()["mtp_phase_profile"]
+        assert phase_profile["counters"]["state_active_reuse_rows"] == 1
+        assert phase_profile["counters"]["state_rollback_rows"] == 1
+        assert phase_profile["counters"][
+            "final_alignment_lm_head_skipped"
+        ] == 2
+        assert "mtp.final_alignment.lm_head" not in phase_profile["phases"]
         for sequence, tokens in zip(sequences, outputs):
             sequence.num_cached_tokens += len(tokens)
             sequence.num_scheduled_tokens = 0

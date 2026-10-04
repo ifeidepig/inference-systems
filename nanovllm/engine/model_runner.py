@@ -574,6 +574,7 @@ class ModelRunner:
         target_positions: torch.Tensor,
         hidden_states: torch.Tensor,
         *,
+        compute_logits: bool = True,
         profile_name: str | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         def profile(suffix: str):
@@ -611,6 +612,8 @@ class ModelRunner:
                 self.mtp_graphs[graph_batch_size].replay()
             draft_hidden = variables["outputs"][:real_batch_size]
             self.mtp_cudagraph_replays += 1
+            if not compute_logits:
+                return draft_hidden, None
             with profile("lm_head"):
                 draft_logits = self.model.compute_logits(draft_hidden)
             return draft_hidden, draft_logits
@@ -622,6 +625,8 @@ class ModelRunner:
                 hidden_states,
                 cu,
             )
+        if not compute_logits:
+            return draft_hidden, None
         with profile("lm_head"):
             draft_logits = self.model.compute_logits(draft_hidden)
         return draft_hidden, draft_logits
@@ -1393,32 +1398,48 @@ class ModelRunner:
             )
         if self.speculative_parallel_verify:
             with self.mtp_phase_profiler.phase("mtp.state_select"):
-                history_indices = (
-                    torch.arange(batch_size, device="cuda")
-                    * self.num_speculative_tokens
-                    + state_boundaries.to(torch.long)
-                )
-                selected_recurrent = [
-                    None
-                    if history is None
-                    else history.index_select(0, history_indices)
-                    for history in recurrent_histories
-                ]
-                selected_conv = [
-                    None
-                    if history is None
-                    else history.index_select(0, history_indices)
-                    for history in conv_histories
-                ]
+                # Verify has already committed the state after its final input
+                # token to each request's active slot. Keep that state in place
+                # whenever it is the accepted boundary and only materialize
+                # rows that must roll back to an earlier boundary.
+                final_verify_boundary = self.num_speculative_tokens - 1
+                rollback_rows = torch.nonzero(
+                    state_boundaries < final_verify_boundary,
+                    as_tuple=False,
+                ).flatten()
+                rollback_count = rollback_rows.numel()
+                selected_recurrent = []
+                selected_conv = []
+                if rollback_count:
+                    history_indices = (
+                        rollback_rows
+                        * self.num_speculative_tokens
+                        + state_boundaries.index_select(
+                            0, rollback_rows
+                        ).to(torch.long)
+                    )
+                    selected_recurrent = [
+                        None
+                        if history is None
+                        else history.index_select(0, history_indices)
+                        for history in recurrent_histories
+                    ]
+                    selected_conv = [
+                        None
+                        if history is None
+                        else history.index_select(0, history_indices)
+                        for history in conv_histories
+                    ]
             with self.mtp_phase_profiler.phase("mtp.state_scatter"):
-                self.state_manager.scatter(
-                    target_state_slot_ids,
-                    selected_recurrent,
-                    selected_conv,
-                    linear_layer_indices=(
-                        self.model.model.linear_attention_layer_indices
-                    ),
-                )
+                if rollback_count:
+                    self.state_manager.scatter(
+                        target_state_slot_ids.index_select(0, rollback_rows),
+                        selected_recurrent,
+                        selected_conv,
+                        linear_layer_indices=(
+                            self.model.model.linear_attention_layer_indices
+                        ),
+                    )
             history_bytes = sum(
                 history.numel() * history.element_size()
                 for history in recurrent_histories + conv_histories
@@ -1437,6 +1458,13 @@ class ModelRunner:
             )
             self.mtp_phase_profiler.add_counter(
                 "state_scatter_logical_bytes", selected_state_bytes
+            )
+            self.mtp_phase_profiler.add_counter(
+                "state_active_reuse_rows",
+                batch_size - rollback_count,
+            )
+            self.mtp_phase_profiler.add_counter(
+                "state_rollback_rows", rollback_count
             )
         else:
             # Snapshot zero is after the guaranteed base token; snapshot i is
@@ -1504,7 +1532,11 @@ class ModelRunner:
             final_tokens,
             final_positions,
             selected_hidden,
+            compute_logits=False,
             profile_name="mtp.final_alignment",
+        )
+        self.mtp_phase_profiler.add_counter(
+            "final_alignment_lm_head_skipped", batch_size
         )
         if self.enforce_eager:
             self.decode_eager_runs += 1
