@@ -192,6 +192,9 @@ KV page. Defaults remain FCFS/LIFO. Deterministic shared-prefix, multi-session,
 unique-prompt, KV-pressure and multi-turn control-plane traces, the GPU A/B
 harness, metrics and evidence limits are documented in
 [docs/hybrid-state-aware-scheduler.md](docs/hybrid-state-aware-scheduler.md).
+The five-run baseline/full matrix, A-G ablation, scheduler CPU profiling,
+joint-boundary counterexample, targeted victim trace and negative workloads are
+reported in [docs/serving-benchmark.md](docs/serving-benchmark.md).
 
 ## Installation
 

@@ -16,7 +16,7 @@ from statistics import median
 from types import SimpleNamespace
 
 from nanovllm import SamplingParams
-from nanovllm.engine.scheduler import Scheduler
+from nanovllm.engine.scheduler import PrefixRecoveryProbe, Scheduler
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 
 
@@ -36,7 +36,7 @@ class SnapshotScheduler(Scheduler):
 
     def __init__(self, config):
         super().__init__(config)
-        self.snapshots: dict[int, tuple[int, int, bool]] = {}
+        self.snapshots: dict[int, tuple[int, int, int, bool]] = {}
 
     def set_snapshot(
         self,
@@ -44,17 +44,43 @@ class SnapshotScheduler(Scheduler):
         *,
         reusable_tokens: int,
         kv_candidate_tokens: int | None = None,
+        gdn_checkpoint_tokens: int | None = None,
         feasible: bool = True,
     ) -> None:
+        kv_tokens = (
+            reusable_tokens
+            if kv_candidate_tokens is None
+            else kv_candidate_tokens
+        )
+        gdn_tokens = (
+            reusable_tokens
+            if gdn_checkpoint_tokens is None
+            else gdn_checkpoint_tokens
+        )
         self.snapshots[sequence.seq_id] = (
+            kv_tokens,
+            gdn_tokens,
             reusable_tokens,
-            reusable_tokens if kv_candidate_tokens is None else kv_candidate_tokens,
             feasible,
         )
 
-    def _probe_prefix(self, seq, *, durable_only=False):
+    def _probe_prefix_details(self, seq, *, durable_only=False):
         del durable_only
-        return self.snapshots.get(seq.seq_id, (0, 0, True))
+        kv_tokens, gdn_tokens, joint_tokens, feasible = self.snapshots.get(
+            seq.seq_id, (0, 0, 0, True)
+        )
+        scoring_tokens = (
+            kv_tokens
+            if self.hybrid_scheduler_score_source == "kv_only"
+            else joint_tokens
+        )
+        return PrefixRecoveryProbe(
+            kv_candidate_tokens=kv_tokens,
+            gdn_checkpoint_tokens=gdn_tokens,
+            joint_recoverable_tokens=joint_tokens,
+            scoring_reusable_tokens=scoring_tokens,
+            feasible=feasible,
+        )
 
 
 def scheduler_config(
@@ -65,6 +91,10 @@ def scheduler_config(
     aging_tokens_per_ms: float,
     max_wait_ms: float,
     min_saved_tokens: int,
+    score_source: str = "joint",
+    enable_aging: bool = True,
+    enable_hysteresis: bool = True,
+    enable_sticky_recovery: bool = True,
 ):
     return SimpleNamespace(
         max_num_seqs=1,
@@ -81,6 +111,12 @@ def scheduler_config(
         hybrid_scheduler_max_wait_ms=max_wait_ms,
         hybrid_scheduler_min_saved_tokens=min_saved_tokens,
         hybrid_scheduler_preemption_penalty=128.0,
+        hybrid_scheduler_score_source=score_source,
+        hybrid_scheduler_enable_aging=enable_aging,
+        hybrid_scheduler_enable_hysteresis=enable_hysteresis,
+        hybrid_scheduler_enable_sticky_recovery=enable_sticky_recovery,
+        enable_scheduler_profiling=True,
+        scheduler_decision_history_size=4096,
         enable_prefix_cache=True,
         enable_chunked_prefill=True,
         enable_hybrid_prefix_cache=False,
@@ -282,6 +318,7 @@ def run_preemption_scenarios(policy: str, args) -> dict:
                 "recompute_tokens": victim.recompute_tokens,
                 "reclaimable_blocks": victim.reclaimable_blocks,
                 "cost_per_block": victim.cost_per_block,
+                "decision_trace": scheduler.get_scheduler_decision_events()[-1],
             }
         )
     return {
@@ -289,6 +326,59 @@ def run_preemption_scenarios(policy: str, args) -> dict:
         "scenarios": choices,
         "total_recompute_tokens": total_recompute,
         "total_reclaimable_blocks": total_reclaimed,
+    }
+
+
+def run_joint_boundary_ablation(score_source: str, args) -> dict:
+    scheduler = SnapshotScheduler(
+        scheduler_config(
+            "hybrid_state_aware",
+            candidate_window=args.candidate_window,
+            aging_tokens_per_ms=args.aging_tokens_per_ms,
+            max_wait_ms=args.max_wait_ms,
+            min_saved_tokens=0,
+            score_source=score_source,
+            enable_aging=False,
+            enable_hysteresis=False,
+            enable_sticky_recovery=False,
+        )
+    )
+    misleading = make_sequence(
+        RequestSpec("kv5000-gdn4096", 5200, 4096, 0)
+    )
+    aligned = make_sequence(
+        RequestSpec("kv4500-gdn4500", 5200, 4500, 0)
+    )
+    scheduler.set_snapshot(
+        misleading,
+        reusable_tokens=4096,
+        kv_candidate_tokens=5000,
+        gdn_checkpoint_tokens=4096,
+    )
+    scheduler.set_snapshot(
+        aligned,
+        reusable_tokens=4500,
+        kv_candidate_tokens=4500,
+        gdn_checkpoint_tokens=4500,
+    )
+    scheduler.add(misleading)
+    scheduler.add(aligned)
+    selected = scheduler._select_waiting_candidate(BASE_NS)
+    probe = scheduler._admission_probe(
+        misleading,
+        0,
+        BASE_NS,
+    )
+    return {
+        "score_source": score_source,
+        "selected": selected.benchmark_name,
+        "misleading_kv_tokens": probe.kv_candidate_tokens,
+        "misleading_gdn_tokens": probe.gdn_checkpoint_tokens,
+        "misleading_joint_tokens": probe.joint_recoverable_tokens,
+        "kv_only_overestimate_tokens": (
+            probe.kv_candidate_tokens - probe.joint_recoverable_tokens
+        ),
+        "decision": scheduler.last_hybrid_scheduler_decision,
     }
 
 
@@ -318,6 +408,7 @@ def main() -> None:
         },
         "admission": {},
         "preemption": {},
+        "joint_boundary_ablation": {},
     }
     for name, specs in workloads().items():
         baseline = run_admission_trace(specs, "fcfs", args)
@@ -333,6 +424,10 @@ def main() -> None:
         }
     for policy in ("lifo", "recompute_aware"):
         results["preemption"][policy] = run_preemption_scenarios(policy, args)
+    for score_source in ("kv_only", "joint"):
+        results["joint_boundary_ablation"][score_source] = (
+            run_joint_boundary_ablation(score_source, args)
+        )
 
     payload = json.dumps(results, indent=2)
     if args.output:

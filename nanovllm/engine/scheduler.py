@@ -31,11 +31,22 @@ class ScheduledBatch:
 
 
 @dataclass(frozen=True, slots=True)
+class PrefixRecoveryProbe:
+    kv_candidate_tokens: int
+    gdn_checkpoint_tokens: int
+    joint_recoverable_tokens: int
+    scoring_reusable_tokens: int
+    feasible: bool
+
+
+@dataclass(frozen=True, slots=True)
 class AdmissionProbe:
     sequence: Sequence
     queue_index: int
     reusable_tokens: int
     kv_candidate_tokens: int
+    gdn_checkpoint_tokens: int
+    joint_recoverable_tokens: int
     uncached_tokens: int
     age_ms: float
     score: float
@@ -45,6 +56,8 @@ class AdmissionProbe:
 @dataclass(frozen=True, slots=True)
 class PreemptionProbe:
     sequence: Sequence
+    computed_tokens: int
+    logical_blocks: int
     reclaimable_blocks: int
     reusable_tokens: int
     recompute_tokens: int
@@ -85,6 +98,24 @@ class Scheduler:
         )
         self.hybrid_scheduler_preemption_penalty = getattr(
             config, "hybrid_scheduler_preemption_penalty", 128.0
+        )
+        self.hybrid_scheduler_score_source = getattr(
+            config, "hybrid_scheduler_score_source", "joint"
+        )
+        self.hybrid_scheduler_enable_aging = getattr(
+            config, "hybrid_scheduler_enable_aging", True
+        )
+        self.hybrid_scheduler_enable_hysteresis = getattr(
+            config, "hybrid_scheduler_enable_hysteresis", True
+        )
+        self.hybrid_scheduler_enable_sticky_recovery = getattr(
+            config, "hybrid_scheduler_enable_sticky_recovery", True
+        )
+        self.enable_scheduler_profiling = getattr(
+            config, "enable_scheduler_profiling", False
+        )
+        self.scheduler_decision_history_size = getattr(
+            config, "scheduler_decision_history_size", 4096
         )
         self.target_ttft_ms = getattr(config, "scheduler_target_ttft_ms", 200.0)
         self.target_tpot_ms = getattr(config, "scheduler_target_tpot_ms", 50.0)
@@ -209,6 +240,21 @@ class Scheduler:
         self.mtp_phase_profiler = PhaseProfiler(
             getattr(config, "enable_mtp_phase_profiling", False)
         )
+        self.scheduler_admission_latency_us: deque[float] = deque(
+            maxlen=self.scheduler_decision_history_size
+        )
+        self.scheduler_probe_latency_us: deque[float] = deque(
+            maxlen=self.scheduler_decision_history_size
+        )
+        self.scheduler_preemption_latency_us: deque[float] = deque(
+            maxlen=self.scheduler_decision_history_size
+        )
+        self.scheduler_metrics_latency_us: deque[float] = deque(
+            maxlen=self.scheduler_decision_history_size
+        )
+        self.scheduler_decision_events: deque[dict] = deque(
+            maxlen=self.scheduler_decision_history_size
+        )
         self.reset_metrics()
 
     def _allocate_state(self, seq: Sequence) -> None:
@@ -253,6 +299,11 @@ class Scheduler:
     def reset_metrics(self) -> None:
         self.mtp_phase_profiler.reset()
         self.block_manager.reset_metrics()
+        self.scheduler_admission_latency_us.clear()
+        self.scheduler_probe_latency_us.clear()
+        self.scheduler_preemption_latency_us.clear()
+        self.scheduler_metrics_latency_us.clear()
+        self.scheduler_decision_events.clear()
         self.prefix_cache_queries = 0
         self.prefix_cache_eligible_blocks = 0
         self.prefix_cache_hit_blocks = 0
@@ -269,22 +320,85 @@ class Scheduler:
         self.slo_infeasible_budget_steps = 0
         self.slo_throughput_priority_steps = 0
         self.last_slo_decision = None
+        self.scheduler_admission_decisions = 0
         self.hybrid_scheduler_admission_decisions = 0
         self.hybrid_scheduler_reorders = 0
         self.hybrid_scheduler_aging_overrides = 0
         self.hybrid_scheduler_candidates_probed = 0
         self.hybrid_scheduler_estimated_saved_prefill_tokens = 0
         self.hybrid_scheduler_selected_reusable_tokens = 0
+        self.hybrid_scheduler_selected_kv_candidate_tokens = 0
+        self.hybrid_scheduler_selected_gdn_checkpoint_tokens = 0
+        self.hybrid_scheduler_selected_joint_recoverable_tokens = 0
+        self.hybrid_scheduler_estimated_remaining_prefill_tokens = 0
+        self.hybrid_scheduler_selected_original_rank_total = 0
+        self.hybrid_scheduler_selected_original_rank_max = 0
+        self.hybrid_scheduler_selected_rank_histogram: dict[int, int] = {}
+        self.hybrid_scheduler_hysteresis_rejections = 0
+        self.hybrid_scheduler_sticky_recovery_triggers = 0
+        self.hybrid_scheduler_starvation_count = 0
         self.hybrid_scheduler_probe_ms = 0.0
+        self.scheduler_admission_decision_ms = 0.0
         self.hybrid_scheduler_max_observed_wait_ms = 0.0
         self.recompute_aware_preemptions = 0
+        self.scheduler_preemption_decisions = 0
+        self.scheduler_victim_computed_tokens = 0
+        self.scheduler_victim_logical_blocks = 0
+        self.scheduler_victim_reclaimable_blocks = 0
+        self.scheduler_victim_recompute_tokens = 0
+        self.scheduler_victim_cost_per_block_sum = 0.0
+        self.scheduler_victim_finite_cost_count = 0
         self.recompute_aware_reclaimed_blocks = 0
         self.recompute_aware_estimated_recompute_tokens = 0
         self.recompute_aware_avoided_recompute_tokens = 0
         self.recompute_aware_selection_ms = 0.0
+        self.scheduler_preemption_selection_ms = 0.0
+        self.scheduler_metrics_bookkeeping_ms = 0.0
+        self.recompute_aware_victim_computed_tokens = 0
+        self.recompute_aware_victim_logical_blocks = 0
+        self.recompute_aware_cost_per_block_sum = 0.0
+        self.recompute_aware_finite_cost_count = 0
+        self.prefill_observed_tokens = 0
+        self.prefill_observed_ms = 0.0
+        self.prefill_tokens_scheduled_total = 0
+        self.prefix_tokens_reused_actual = 0
+        self.decode_observed_tokens = 0
+        self.decode_observed_ms = 0.0
         self.last_hybrid_scheduler_decision = None
         if self.hybrid_prefix_coordinator is not None:
             self.hybrid_prefix_coordinator.reset_metrics()
+
+    @staticmethod
+    def _latency_summary(values: deque[float]) -> dict[str, float | int]:
+        if not values:
+            return {
+                "count": 0,
+                "mean_us": 0.0,
+                "p50_us": 0.0,
+                "p95_us": 0.0,
+                "p99_us": 0.0,
+                "max_us": 0.0,
+            }
+        ordered = sorted(values)
+
+        def percentile(probability: float) -> float:
+            index = min(
+                max(int(probability * len(ordered) + 0.999999) - 1, 0),
+                len(ordered) - 1,
+            )
+            return ordered[index]
+
+        return {
+            "count": len(ordered),
+            "mean_us": sum(ordered) / len(ordered),
+            "p50_us": percentile(0.50),
+            "p95_us": percentile(0.95),
+            "p99_us": percentile(0.99),
+            "max_us": ordered[-1],
+        }
+
+    def get_scheduler_decision_events(self) -> list[dict]:
+        return list(self.scheduler_decision_events)
 
     def get_metrics(self) -> dict[str, object]:
         eligible = self.prefix_cache_eligible_blocks
@@ -311,12 +425,34 @@ class Scheduler:
             "slo_infeasible_budget_steps": self.slo_infeasible_budget_steps,
             "slo_throughput_priority_steps": self.slo_throughput_priority_steps,
             "last_slo_decision": self.last_slo_decision,
+            "scheduler_admission_decisions": (
+                self.scheduler_admission_decisions
+            ),
             "waiting_admission_policy": self.waiting_admission_policy,
             "preemption_policy": self.preemption_policy,
+            "hybrid_scheduler_score_source": (
+                self.hybrid_scheduler_score_source
+            ),
+            "hybrid_scheduler_aging_enabled": (
+                self.hybrid_scheduler_enable_aging
+            ),
+            "hybrid_scheduler_hysteresis_enabled": (
+                self.hybrid_scheduler_enable_hysteresis
+            ),
+            "hybrid_scheduler_sticky_recovery_enabled": (
+                self.hybrid_scheduler_enable_sticky_recovery
+            ),
+            "scheduler_profiling_enabled": self.enable_scheduler_profiling,
             "hybrid_scheduler_admission_decisions": (
                 self.hybrid_scheduler_admission_decisions
             ),
             "hybrid_scheduler_reorders": self.hybrid_scheduler_reorders,
+            "hybrid_scheduler_reorder_rate": (
+                self.hybrid_scheduler_reorders
+                / self.hybrid_scheduler_admission_decisions
+                if self.hybrid_scheduler_admission_decisions
+                else 0.0
+            ),
             "hybrid_scheduler_aging_overrides": (
                 self.hybrid_scheduler_aging_overrides
             ),
@@ -329,11 +465,74 @@ class Scheduler:
             "hybrid_scheduler_selected_reusable_tokens": (
                 self.hybrid_scheduler_selected_reusable_tokens
             ),
+            "hybrid_scheduler_selected_kv_candidate_tokens": (
+                self.hybrid_scheduler_selected_kv_candidate_tokens
+            ),
+            "hybrid_scheduler_selected_gdn_checkpoint_tokens": (
+                self.hybrid_scheduler_selected_gdn_checkpoint_tokens
+            ),
+            "hybrid_scheduler_selected_joint_recoverable_tokens": (
+                self.hybrid_scheduler_selected_joint_recoverable_tokens
+            ),
+            "hybrid_scheduler_estimated_remaining_prefill_tokens": (
+                self.hybrid_scheduler_estimated_remaining_prefill_tokens
+            ),
+            "hybrid_scheduler_selected_original_rank_mean": (
+                self.hybrid_scheduler_selected_original_rank_total
+                / self.hybrid_scheduler_admission_decisions
+                if self.hybrid_scheduler_admission_decisions
+                else 0.0
+            ),
+            "hybrid_scheduler_selected_original_rank_max": (
+                self.hybrid_scheduler_selected_original_rank_max
+            ),
+            "hybrid_scheduler_selected_rank_histogram": dict(
+                sorted(self.hybrid_scheduler_selected_rank_histogram.items())
+            ),
+            "hybrid_scheduler_hysteresis_rejections": (
+                self.hybrid_scheduler_hysteresis_rejections
+            ),
+            "hybrid_scheduler_sticky_recovery_triggers": (
+                self.hybrid_scheduler_sticky_recovery_triggers
+            ),
+            "hybrid_scheduler_starvation_count": (
+                self.hybrid_scheduler_starvation_count
+            ),
             "hybrid_scheduler_probe_ms": self.hybrid_scheduler_probe_ms,
+            "scheduler_admission_decision_ms": (
+                self.scheduler_admission_decision_ms
+            ),
+            "hybrid_scheduler_admission_latency": self._latency_summary(
+                self.scheduler_admission_latency_us
+            ),
+            "hybrid_scheduler_probe_latency": self._latency_summary(
+                self.scheduler_probe_latency_us
+            ),
             "hybrid_scheduler_max_observed_wait_ms": (
                 self.hybrid_scheduler_max_observed_wait_ms
             ),
             "recompute_aware_preemptions": self.recompute_aware_preemptions,
+            "scheduler_preemption_decisions": (
+                self.scheduler_preemption_decisions
+            ),
+            "scheduler_victim_computed_tokens": (
+                self.scheduler_victim_computed_tokens
+            ),
+            "scheduler_victim_logical_blocks": (
+                self.scheduler_victim_logical_blocks
+            ),
+            "scheduler_victim_reclaimable_blocks": (
+                self.scheduler_victim_reclaimable_blocks
+            ),
+            "scheduler_victim_recompute_tokens": (
+                self.scheduler_victim_recompute_tokens
+            ),
+            "scheduler_victim_mean_cost_per_reclaimed_block": (
+                self.scheduler_victim_cost_per_block_sum
+                / self.scheduler_victim_finite_cost_count
+                if self.scheduler_victim_finite_cost_count
+                else 0.0
+            ),
             "recompute_aware_reclaimed_blocks": (
                 self.recompute_aware_reclaimed_blocks
             ),
@@ -346,6 +545,38 @@ class Scheduler:
             "recompute_aware_selection_ms": (
                 self.recompute_aware_selection_ms
             ),
+            "scheduler_preemption_selection_ms": (
+                self.scheduler_preemption_selection_ms
+            ),
+            "scheduler_metrics_bookkeeping_ms": (
+                self.scheduler_metrics_bookkeeping_ms
+            ),
+            "recompute_aware_selection_latency": self._latency_summary(
+                self.scheduler_preemption_latency_us
+            ),
+            "scheduler_metrics_bookkeeping_latency": self._latency_summary(
+                self.scheduler_metrics_latency_us
+            ),
+            "recompute_aware_victim_computed_tokens": (
+                self.recompute_aware_victim_computed_tokens
+            ),
+            "recompute_aware_victim_logical_blocks": (
+                self.recompute_aware_victim_logical_blocks
+            ),
+            "recompute_aware_mean_cost_per_reclaimed_block": (
+                self.recompute_aware_cost_per_block_sum
+                / self.recompute_aware_finite_cost_count
+                if self.recompute_aware_finite_cost_count
+                else 0.0
+            ),
+            "prefill_observed_tokens": self.prefill_observed_tokens,
+            "prefill_observed_ms": self.prefill_observed_ms,
+            "prefill_tokens_scheduled_total": (
+                self.prefill_tokens_scheduled_total
+            ),
+            "prefix_tokens_reused_actual": self.prefix_tokens_reused_actual,
+            "decode_observed_tokens": self.decode_observed_tokens,
+            "decode_observed_ms": self.decode_observed_ms,
             "last_hybrid_scheduler_decision": (
                 self.last_hybrid_scheduler_decision
             ),
@@ -554,6 +785,8 @@ class Scheduler:
             )
             self.mtp_phase_profiler.record_cpu(phase_name, duration_ms)
         if is_prefill:
+            self.prefill_observed_tokens += num_tokens
+            self.prefill_observed_ms += duration_ms
             self.prefill_base_ms = (
                 duration_ms
                 if self.prefill_base_ms is None
@@ -572,6 +805,8 @@ class Scheduler:
                         self.prefill_ms_per_token_ewma, observation
                     )
         else:
+            self.decode_observed_tokens += num_tokens
+            self.decode_observed_ms += duration_ms
             self.decode_step_ms_ewma = self._update_ewma(
                 self.decode_step_ms_ewma, duration_ms
             )
@@ -621,15 +856,16 @@ class Scheduler:
             "kv_pressure": self._kv_pressure(),
         }
 
-    def _probe_prefix(
+    def _probe_prefix_details(
         self,
         seq: Sequence,
         *,
         durable_only: bool = False,
-    ) -> tuple[int, int, bool]:
-        """Return reusable tokens, KV-only tokens, and allocation feasibility."""
+    ) -> PrefixRecoveryProbe:
+        """Read recoverability without mutating cache or request ownership."""
         if seq.block_table and not durable_only:
-            return seq.num_cached_tokens, seq.num_cached_tokens, True
+            tokens = seq.num_cached_tokens
+            return PrefixRecoveryProbe(tokens, tokens, tokens, tokens, True)
         if self.enable_hybrid_prefix_cache:
             probe = self.hybrid_prefix_coordinator.probe(seq)
             candidate = probe.candidate
@@ -642,13 +878,23 @@ class Scheduler:
                 and not self.state_manager.can_allocate
             ):
                 feasible = False
-            return (
-                probe.boundary_tokens,
-                probe.kv_candidate_tokens,
-                feasible,
+            joint_tokens = probe.boundary_tokens
+            scoring_tokens = (
+                probe.kv_candidate_tokens
+                if self.hybrid_scheduler_score_source == "kv_only"
+                else joint_tokens
+            )
+            return PrefixRecoveryProbe(
+                kv_candidate_tokens=probe.kv_candidate_tokens,
+                gdn_checkpoint_tokens=joint_tokens,
+                joint_recoverable_tokens=joint_tokens,
+                scoring_reusable_tokens=scoring_tokens,
+                feasible=feasible,
             )
         if not self.enable_prefix_cache:
-            return (
+            return PrefixRecoveryProbe(
+                0,
+                0,
                 0,
                 0,
                 len(self.block_manager.free_block_ids) >= seq.num_blocks,
@@ -663,7 +909,27 @@ class Scheduler:
             and not self.state_manager.can_allocate
         ):
             feasible = False
-        return reusable_tokens, reusable_tokens, feasible
+        return PrefixRecoveryProbe(
+            reusable_tokens,
+            reusable_tokens,
+            reusable_tokens,
+            reusable_tokens,
+            feasible,
+        )
+
+    def _probe_prefix(
+        self,
+        seq: Sequence,
+        *,
+        durable_only: bool = False,
+    ) -> tuple[int, int, bool]:
+        """Compatibility view: scoring tokens, KV tokens, feasibility."""
+        probe = self._probe_prefix_details(seq, durable_only=durable_only)
+        return (
+            probe.scoring_reusable_tokens,
+            probe.kv_candidate_tokens,
+            probe.feasible,
+        )
 
     def _admission_probe(
         self,
@@ -671,22 +937,24 @@ class Scheduler:
         queue_index: int,
         now_ns: int,
     ) -> AdmissionProbe:
-        reusable, kv_candidate, feasible = self._probe_prefix(seq)
+        prefix = self._probe_prefix_details(seq)
+        reusable = prefix.scoring_reusable_tokens
         uncached = max(seq.num_tokens - reusable, 0)
         age_ms = max((now_ns - seq.arrival_time_ns) / 1e6, 0.0)
-        score = (
-            uncached
-            - self.hybrid_scheduler_aging_tokens_per_ms * age_ms
-        )
+        score = uncached
+        if self.hybrid_scheduler_enable_aging:
+            score -= self.hybrid_scheduler_aging_tokens_per_ms * age_ms
         return AdmissionProbe(
             sequence=seq,
             queue_index=queue_index,
             reusable_tokens=reusable,
-            kv_candidate_tokens=kv_candidate,
+            kv_candidate_tokens=prefix.kv_candidate_tokens,
+            gdn_checkpoint_tokens=prefix.gdn_checkpoint_tokens,
+            joint_recoverable_tokens=prefix.joint_recoverable_tokens,
             uncached_tokens=uncached,
             age_ms=age_ms,
             score=score,
-            feasible=feasible,
+            feasible=prefix.feasible,
         )
 
     def _select_waiting_candidate(
@@ -695,20 +963,56 @@ class Scheduler:
     ) -> Sequence:
         if not self.waiting:
             raise RuntimeError("cannot select from an empty waiting queue")
+        self.scheduler_admission_decisions += 1
+        started = perf_counter_ns() if self.enable_scheduler_profiling else 0
         if self.waiting_admission_policy == "fcfs":
+            if self.enable_scheduler_profiling:
+                decision_us = (perf_counter_ns() - started) / 1e3
+                self.scheduler_admission_latency_us.append(decision_us)
+                self.scheduler_admission_decision_ms += decision_us / 1e3
+                self.scheduler_decision_events.append(
+                    {
+                        "type": "admission",
+                        "reason": "fcfs",
+                        "selected_request_id": self.waiting[0].seq_id,
+                        "queue_index": 0,
+                    }
+                )
             return self.waiting[0]
         head = self.waiting[0]
         # Continue requests that already own resources, and recover preempted
         # work before reordering new admissions.
-        if head.block_table or head.preemption_count:
+        if (
+            self.hybrid_scheduler_enable_sticky_recovery
+            and (head.block_table or head.preemption_count)
+        ):
+            self.hybrid_scheduler_sticky_recovery_triggers += 1
+            if self.enable_scheduler_profiling:
+                decision_us = (perf_counter_ns() - started) / 1e3
+                self.scheduler_admission_latency_us.append(decision_us)
+                self.scheduler_admission_decision_ms += decision_us / 1e3
+                self.scheduler_decision_events.append(
+                    {
+                        "type": "admission",
+                        "reason": "sticky_recovery",
+                        "selected_request_id": head.seq_id,
+                        "queue_index": 0,
+                    }
+                )
             return head
         now_ns = now_ns if now_ns is not None else perf_counter_ns()
-        started = perf_counter_ns()
         window = list(self.waiting)[: self.hybrid_scheduler_candidate_window]
+        probe_started = (
+            perf_counter_ns() if self.enable_scheduler_profiling else 0
+        )
         probes = [
             self._admission_probe(seq, index, now_ns)
             for index, seq in enumerate(window)
         ]
+        if self.enable_scheduler_profiling:
+            probe_us = (perf_counter_ns() - probe_started) / 1e3
+            self.scheduler_probe_latency_us.append(probe_us)
+            self.hybrid_scheduler_probe_ms += probe_us / 1e3
         self.hybrid_scheduler_candidates_probed += len(probes)
         self.hybrid_scheduler_admission_decisions += 1
         self.hybrid_scheduler_max_observed_wait_ms = max(
@@ -728,11 +1032,15 @@ class Scheduler:
                     probe.sequence.seq_id,
                 ),
             )
-            overdue = [
-                probe
-                for probe in feasible
-                if probe.age_ms >= self.hybrid_scheduler_max_wait_ms
-            ]
+            overdue = (
+                [
+                    probe
+                    for probe in feasible
+                    if probe.age_ms >= self.hybrid_scheduler_max_wait_ms
+                ]
+                if self.hybrid_scheduler_enable_aging
+                else []
+            )
             if overdue:
                 chosen = min(
                     overdue,
@@ -750,20 +1058,32 @@ class Scheduler:
                 head_probe = probes[0]
                 saved = head_probe.uncached_tokens - chosen.uncached_tokens
                 if (
+                    self.hybrid_scheduler_enable_hysteresis
+                    and
                     chosen.queue_index
                     and head_probe.feasible
                     and saved < self.hybrid_scheduler_min_saved_tokens
                 ):
                     chosen = head_probe
                     reason = "benefit_below_hysteresis"
+                    self.hybrid_scheduler_hysteresis_rejections += 1
 
         # Only requests jumped over by the selected candidate were bypassed.
         # Requests behind the selected position merely retain normal queue order.
         for probe in probes:
             if probe.queue_index < chosen.queue_index:
                 probe.sequence.mark_bypassed()
+                if probe.age_ms >= self.hybrid_scheduler_max_wait_ms:
+                    self.hybrid_scheduler_starvation_count += 1
         chosen.sequence.last_scheduler_score = chosen.score
         chosen.sequence.last_reusable_tokens = chosen.reusable_tokens
+        chosen.sequence.last_kv_candidate_tokens = chosen.kv_candidate_tokens
+        chosen.sequence.last_gdn_checkpoint_tokens = (
+            chosen.gdn_checkpoint_tokens
+        )
+        chosen.sequence.last_joint_recoverable_tokens = (
+            chosen.joint_recoverable_tokens
+        )
         if chosen.queue_index:
             self.waiting.remove(chosen.sequence)
             self.waiting.appendleft(chosen.sequence)
@@ -776,24 +1096,54 @@ class Scheduler:
         self.hybrid_scheduler_selected_reusable_tokens += (
             chosen.reusable_tokens
         )
-        self.hybrid_scheduler_probe_ms += (
-            perf_counter_ns() - started
-        ) / 1e6
+        self.hybrid_scheduler_selected_kv_candidate_tokens += (
+            chosen.kv_candidate_tokens
+        )
+        self.hybrid_scheduler_selected_gdn_checkpoint_tokens += (
+            chosen.gdn_checkpoint_tokens
+        )
+        self.hybrid_scheduler_selected_joint_recoverable_tokens += (
+            chosen.joint_recoverable_tokens
+        )
+        self.hybrid_scheduler_estimated_remaining_prefill_tokens += (
+            chosen.uncached_tokens
+        )
+        self.hybrid_scheduler_selected_original_rank_total += chosen.queue_index
+        self.hybrid_scheduler_selected_original_rank_max = max(
+            self.hybrid_scheduler_selected_original_rank_max,
+            chosen.queue_index,
+        )
+        self.hybrid_scheduler_selected_rank_histogram[chosen.queue_index] = (
+            self.hybrid_scheduler_selected_rank_histogram.get(
+                chosen.queue_index, 0
+            )
+            + 1
+        )
         self.last_hybrid_scheduler_decision = {
             "reason": reason,
             "selected_request_id": chosen.sequence.seq_id,
             "queue_index": chosen.queue_index,
             "reusable_tokens": chosen.reusable_tokens,
             "kv_candidate_tokens": chosen.kv_candidate_tokens,
+            "gdn_checkpoint_tokens": chosen.gdn_checkpoint_tokens,
+            "joint_recoverable_tokens": chosen.joint_recoverable_tokens,
             "uncached_tokens": chosen.uncached_tokens,
             "age_ms": chosen.age_ms,
             "score": chosen.score,
             "window": len(probes),
         }
+        if self.enable_scheduler_profiling:
+            decision_us = (perf_counter_ns() - started) / 1e3
+            self.scheduler_admission_latency_us.append(decision_us)
+            self.scheduler_admission_decision_ms += decision_us / 1e3
+            self.scheduler_decision_events.append(
+                {"type": "admission", **self.last_hybrid_scheduler_decision}
+            )
         return chosen.sequence
 
     def _preemption_probe(self, seq: Sequence) -> PreemptionProbe:
-        reusable, _, _ = self._probe_prefix(seq, durable_only=True)
+        prefix = self._probe_prefix_details(seq, durable_only=True)
+        reusable = prefix.scoring_reusable_tokens
         reclaimable = self.block_manager.reclaimable_blocks(seq)
         recompute = max(seq.num_cached_tokens - reusable, 0)
         if reclaimable:
@@ -806,22 +1156,81 @@ class Scheduler:
             cost = float("inf")
         return PreemptionProbe(
             sequence=seq,
+            computed_tokens=seq.num_cached_tokens,
+            logical_blocks=len(seq.block_table),
             reclaimable_blocks=reclaimable,
             reusable_tokens=reusable,
             recompute_tokens=recompute,
             cost_per_block=cost,
         )
 
+    @staticmethod
+    def _preemption_trace(probe: PreemptionProbe) -> dict:
+        return {
+            "request_id": probe.sequence.seq_id,
+            "computed_tokens": probe.computed_tokens,
+            "reusable_tokens": probe.reusable_tokens,
+            "recompute_tokens": probe.recompute_tokens,
+            "logical_blocks": probe.logical_blocks,
+            "reclaimable_blocks": probe.reclaimable_blocks,
+            "cost_per_block": (
+                probe.cost_per_block
+                if probe.cost_per_block != float("inf")
+                else None
+            ),
+        }
+
+    def _record_preemption_probe(self, probe: PreemptionProbe) -> None:
+        self.scheduler_victim_computed_tokens += probe.computed_tokens
+        self.scheduler_victim_logical_blocks += probe.logical_blocks
+        self.scheduler_victim_reclaimable_blocks += probe.reclaimable_blocks
+        self.scheduler_victim_recompute_tokens += probe.recompute_tokens
+        if probe.cost_per_block != float("inf"):
+            self.scheduler_victim_cost_per_block_sum += probe.cost_per_block
+            self.scheduler_victim_finite_cost_count += 1
+
     def _select_preemption_victim(
         self,
         current: Sequence,
     ) -> PreemptionProbe:
+        self.scheduler_preemption_decisions += 1
         candidates = [*self.running, current]
         if self.preemption_policy == "lifo":
-            return self._preemption_probe(
-                self.running[-1] if self.running else current
+            if not self.enable_scheduler_profiling:
+                selected = self.running[-1] if self.running else current
+                return PreemptionProbe(
+                    sequence=selected,
+                    computed_tokens=selected.num_cached_tokens,
+                    logical_blocks=len(selected.block_table),
+                    reclaimable_blocks=0,
+                    reusable_tokens=0,
+                    recompute_tokens=0,
+                    cost_per_block=0.0,
+                )
+            selection_started = perf_counter_ns()
+            selected = self.running[-1] if self.running else current
+            selection_us = (perf_counter_ns() - selection_started) / 1e3
+            bookkeeping_started = perf_counter_ns()
+            probe = self._preemption_probe(selected)
+            bookkeeping_us = (perf_counter_ns() - bookkeeping_started) / 1e3
+            self.scheduler_preemption_latency_us.append(selection_us)
+            self.scheduler_metrics_latency_us.append(bookkeeping_us)
+            self.scheduler_metrics_bookkeeping_ms += bookkeeping_us / 1e3
+            self.scheduler_preemption_selection_ms += selection_us / 1e3
+            self._record_preemption_probe(probe)
+            self.scheduler_decision_events.append(
+                {
+                    "type": "preemption",
+                    "policy": "lifo",
+                    "selected_request_id": selected.seq_id,
+                    "candidates": [self._preemption_trace(probe)],
+                }
             )
-        started = perf_counter_ns()
+            probe.sequence.estimated_recompute_tokens_lost += (
+                probe.recompute_tokens
+            )
+            return probe
+        started = perf_counter_ns() if self.enable_scheduler_profiling else 0
         probes = [self._preemption_probe(seq) for seq in candidates]
         chosen = min(
             probes,
@@ -831,10 +1240,13 @@ class Scheduler:
                 probe.sequence.seq_id,
             ),
         )
-        baseline = self._preemption_probe(
-            self.running[-1] if self.running else current
+        baseline_sequence = self.running[-1] if self.running else current
+        baseline = next(
+            probe for probe in probes
+            if probe.sequence is baseline_sequence
         )
         self.recompute_aware_preemptions += 1
+        self._record_preemption_probe(chosen)
         self.recompute_aware_reclaimed_blocks += chosen.reclaimable_blocks
         self.recompute_aware_estimated_recompute_tokens += (
             chosen.recompute_tokens
@@ -843,9 +1255,27 @@ class Scheduler:
             baseline.recompute_tokens - chosen.recompute_tokens,
             0,
         )
-        self.recompute_aware_selection_ms += (
-            perf_counter_ns() - started
-        ) / 1e6
+        self.recompute_aware_victim_computed_tokens += chosen.computed_tokens
+        self.recompute_aware_victim_logical_blocks += chosen.logical_blocks
+        if chosen.cost_per_block != float("inf"):
+            self.recompute_aware_cost_per_block_sum += chosen.cost_per_block
+            self.recompute_aware_finite_cost_count += 1
+        if self.enable_scheduler_profiling:
+            selection_us = (perf_counter_ns() - started) / 1e3
+            self.scheduler_preemption_latency_us.append(selection_us)
+            self.recompute_aware_selection_ms += selection_us / 1e3
+            self.scheduler_preemption_selection_ms += selection_us / 1e3
+            self.scheduler_decision_events.append(
+                {
+                    "type": "preemption",
+                    "policy": "recompute_aware",
+                    "selected_request_id": chosen.sequence.seq_id,
+                    "lifo_request_id": baseline.sequence.seq_id,
+                    "candidates": [
+                        self._preemption_trace(probe) for probe in probes
+                    ],
+                }
+            )
         chosen.sequence.estimated_recompute_tokens_lost += (
             chosen.recompute_tokens
         )
@@ -948,6 +1378,19 @@ class Scheduler:
                     self.block_manager.allocate(seq, num_cached_blocks)
                     if self.state_manager is not None:
                         self._allocate_state(seq)
+                if plan is not None:
+                    kv_tokens = plan.kv_candidate_tokens
+                    joint_tokens = plan.boundary_tokens
+                    gdn_tokens = joint_tokens
+                else:
+                    joint_tokens = num_cached_blocks * self.block_size
+                    kv_tokens = joint_tokens
+                    gdn_tokens = joint_tokens
+                seq.last_kv_candidate_tokens = kv_tokens
+                seq.last_gdn_checkpoint_tokens = gdn_tokens
+                seq.last_joint_recoverable_tokens = joint_tokens
+                seq.prefix_tokens_reused += joint_tokens
+                self.prefix_tokens_reused_actual += joint_tokens
                 self.prefix_cache_hit_blocks += num_cached_blocks
                 seq.prefix_cache_hit_blocks += num_cached_blocks
             seq.num_scheduled_tokens = min(num_tokens, remaining)
@@ -962,6 +1405,8 @@ class Scheduler:
                     if 0 < distance < seq.num_scheduled_tokens:
                         seq.num_scheduled_tokens = distance
             seq.mark_scheduled()
+            seq.prefill_tokens_executed += seq.num_scheduled_tokens
+            self.prefill_tokens_scheduled_total += seq.num_scheduled_tokens
             if seq.num_scheduled_tokens < num_tokens:
                 self.chunked_prefill_steps += 1
             num_batched_tokens += seq.num_scheduled_tokens

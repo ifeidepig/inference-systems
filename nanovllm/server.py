@@ -286,6 +286,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--hybrid-scheduler-preemption-penalty", type=float, default=128.0
     )
+    parser.add_argument(
+        "--hybrid-scheduler-score-source",
+        choices=("joint", "kv_only"),
+        default="joint",
+    )
+    parser.add_argument("--disable-hybrid-scheduler-aging", action="store_true")
+    parser.add_argument(
+        "--disable-hybrid-scheduler-hysteresis", action="store_true"
+    )
+    parser.add_argument(
+        "--disable-hybrid-scheduler-sticky-recovery", action="store_true"
+    )
+    parser.add_argument("--enable-scheduler-profiling", action="store_true")
+    parser.add_argument("--scheduler-decision-history-size", type=int, default=4096)
     parser.add_argument("--target-ttft-ms", type=float, default=200.0)
     parser.add_argument("--target-tpot-ms", type=float, default=50.0)
     parser.add_argument("--slo-min-prefill-tokens", type=int, default=64)
@@ -395,6 +409,18 @@ def main() -> None:
         hybrid_scheduler_preemption_penalty=(
             args.hybrid_scheduler_preemption_penalty
         ),
+        hybrid_scheduler_score_source=args.hybrid_scheduler_score_source,
+        hybrid_scheduler_enable_aging=(
+            not args.disable_hybrid_scheduler_aging
+        ),
+        hybrid_scheduler_enable_hysteresis=(
+            not args.disable_hybrid_scheduler_hysteresis
+        ),
+        hybrid_scheduler_enable_sticky_recovery=(
+            not args.disable_hybrid_scheduler_sticky_recovery
+        ),
+        enable_scheduler_profiling=args.enable_scheduler_profiling,
+        scheduler_decision_history_size=args.scheduler_decision_history_size,
         scheduler_target_ttft_ms=args.target_ttft_ms,
         scheduler_target_tpot_ms=args.target_tpot_ms,
         slo_min_prefill_tokens=args.slo_min_prefill_tokens,

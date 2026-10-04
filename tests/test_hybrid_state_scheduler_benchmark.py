@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from benchmark_hybrid_state_scheduler import (
     RequestSpec,
     run_admission_trace,
+    run_joint_boundary_ablation,
     run_preemption_scenarios,
     workloads,
 )
@@ -69,3 +70,14 @@ def test_recompute_aware_preemption_reduces_estimated_replay():
 
     assert aware["total_recompute_tokens"] < lifo["total_recompute_tokens"]
     assert aware["total_reclaimable_blocks"] > 0
+
+
+def test_joint_boundary_scoring_avoids_kv_only_overestimate():
+    args = _args()
+
+    kv_only = run_joint_boundary_ablation("kv_only", args)
+    joint = run_joint_boundary_ablation("joint", args)
+
+    assert kv_only["kv_only_overestimate_tokens"] == 904
+    assert kv_only["selected"] == "kv5000-gdn4096"
+    assert joint["selected"] == "kv4500-gdn4500"

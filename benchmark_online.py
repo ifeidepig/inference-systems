@@ -97,6 +97,48 @@ def generate_workload(
     return workload
 
 
+def generate_scheduler_profile(profile: str) -> list[RequestSpec]:
+    """Fixed traces used by the scheduler validation matrix."""
+    if profile == "shared_prefix":
+        groups = [None, 0, 0, 0, 0, 0]
+        lengths = [560] * len(groups)
+        outputs = [4] * len(groups)
+    elif profile == "multi_session":
+        groups = [None, 0, 1, None, 0, 1, 0, 1]
+        lengths = [560] * len(groups)
+        outputs = [4] * len(groups)
+    elif profile == "unique_prompt":
+        groups = [None] * 8
+        lengths = [560] * len(groups)
+        outputs = [4] * len(groups)
+    elif profile == "kv_pressure":
+        groups = [None, 0, None, 0, None, 0, None, 0]
+        lengths = [256] * len(groups)
+        outputs = [8] * len(groups)
+    elif profile == "kv_pressure_victim_choice":
+        # LIFO sees a cold newest victim; cost-aware preemption can instead
+        # choose a request with a durable 240-token joint checkpoint.
+        groups = [0, None, 0, None, 0, None, 0, None]
+        lengths = [256] * len(groups)
+        outputs = [8] * len(groups)
+    elif profile == "multi_turn":
+        groups = [None, 0, None, 0, None, 0]
+        lengths = [832, 320, 832, 576, 832, 832]
+        outputs = [4] * len(groups)
+    else:
+        raise ValueError(f"unknown scheduler workload profile: {profile}")
+    return [
+        RequestSpec(
+            request_index=index,
+            arrival_offset_ms=0.0,
+            prompt_length=lengths[index],
+            output_length=outputs[index],
+            shared_prefix_group=groups[index],
+        )
+        for index in range(len(groups))
+    ]
+
+
 def build_prompt(
     spec: RequestSpec,
     base_token_id: int,
@@ -145,6 +187,7 @@ def summarize_requests(
     ]
     queue_values = [request["queue_ms"] for request in requests]
     admission_values = [request["admission_delay_ms"] for request in requests]
+    e2e_values = [request["e2e_ms"] for request in requests]
     ttft_violations = sum(value > target_ttft_ms for value in ttft_values)
     tpot_violations = sum(value > target_tpot_ms for value in max_gap_values)
     request_violations = sum(
@@ -161,6 +204,7 @@ def summarize_requests(
         "max_token_gap_ms": summarize(max_gap_values),
         "queue_ms": summarize(queue_values),
         "admission_delay_ms": summarize(admission_values),
+        "request_latency_ms": summarize(e2e_values),
         "ttft_slo_violation_rate": ttft_violations / len(requests),
         "tpot_slo_violation_rate": tpot_violations / len(max_gap_values),
         "request_slo_violation_rate": request_violations / len(requests),
@@ -199,6 +243,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument(
+        "--workload-profile",
+        choices=(
+            "custom",
+            "shared_prefix",
+            "multi_session",
+            "unique_prompt",
+            "kv_pressure",
+            "kv_pressure_victim_choice",
+            "multi_turn",
+        ),
+        default="custom",
+    )
+    parser.add_argument("--run-label", default="standalone")
+    parser.add_argument("--workload-name", default="custom")
+    parser.add_argument("--repeat-index", type=int, default=0)
     parser.add_argument("--target-ttft-ms", type=float, default=200.0)
     parser.add_argument("--target-tpot-ms", type=float, default=50.0)
     parser.add_argument("--max-model-len", type=int, default=1024)
@@ -229,6 +289,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--hybrid-scheduler-preemption-penalty", type=float, default=128.0
     )
+    parser.add_argument(
+        "--hybrid-scheduler-score-source",
+        choices=("joint", "kv_only"),
+        default="joint",
+    )
+    parser.add_argument("--disable-hybrid-scheduler-aging", action="store_true")
+    parser.add_argument(
+        "--disable-hybrid-scheduler-hysteresis", action="store_true"
+    )
+    parser.add_argument(
+        "--disable-hybrid-scheduler-sticky-recovery", action="store_true"
+    )
+    parser.add_argument("--enable-scheduler-profiling", action="store_true")
+    parser.add_argument("--scheduler-decision-history-size", type=int, default=4096)
     parser.add_argument("--slo-min-prefill-tokens", type=int, default=64)
     parser.add_argument("--slo-kv-pressure-threshold", type=float, default=0.9)
     parser.add_argument("--slo-queue-pressure-threshold", type=int, default=3)
@@ -277,7 +351,11 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("prefix seed request count cannot be negative")
     if min(args.output_lengths) < 2:
         raise ValueError("online SLO measurement requires at least two output tokens")
-    if max(args.prompt_lengths) + max(args.output_lengths) > args.max_model_len:
+    if (
+        args.workload_profile == "custom"
+        and max(args.prompt_lengths) + max(args.output_lengths)
+        > args.max_model_len
+    ):
         raise ValueError("a configured request shape exceeds --max-model-len")
     if 256 % args.prefix_match_unit:
         raise ValueError("prefix match unit must divide the 256-token KV page")
@@ -295,17 +373,25 @@ def validate_args(args: argparse.Namespace) -> None:
 def main() -> None:
     args = parse_args()
     validate_args(args)
-    workload = generate_workload(
-        args.num_requests,
-        args.request_rate,
-        args.arrival_pattern,
-        args.prompt_lengths,
-        args.output_lengths,
-        args.shared_prefix_ratio,
-        args.shared_prefix_groups,
-        args.seed,
-        args.burst_size,
+    workload = (
+        generate_workload(
+            args.num_requests,
+            args.request_rate,
+            args.arrival_pattern,
+            args.prompt_lengths,
+            args.output_lengths,
+            args.shared_prefix_ratio,
+            args.shared_prefix_groups,
+            args.seed,
+            args.burst_size,
+        )
+        if args.workload_profile == "custom"
+        else generate_scheduler_profile(args.workload_profile)
     )
+    if max(
+        spec.prompt_length + spec.output_length for spec in workload
+    ) > args.max_model_len:
+        raise ValueError("scheduler profile exceeds --max-model-len")
     llm = LLM(
         str(args.model),
         enforce_eager=not args.use_cuda_graph,
@@ -332,6 +418,18 @@ def main() -> None:
         hybrid_scheduler_preemption_penalty=(
             args.hybrid_scheduler_preemption_penalty
         ),
+        hybrid_scheduler_score_source=args.hybrid_scheduler_score_source,
+        hybrid_scheduler_enable_aging=(
+            not args.disable_hybrid_scheduler_aging
+        ),
+        hybrid_scheduler_enable_hysteresis=(
+            not args.disable_hybrid_scheduler_hysteresis
+        ),
+        hybrid_scheduler_enable_sticky_recovery=(
+            not args.disable_hybrid_scheduler_sticky_recovery
+        ),
+        enable_scheduler_profiling=args.enable_scheduler_profiling,
+        scheduler_decision_history_size=args.scheduler_decision_history_size,
         scheduler_target_ttft_ms=args.target_ttft_ms,
         scheduler_target_tpot_ms=args.target_tpot_ms,
         slo_min_prefill_tokens=args.slo_min_prefill_tokens,
@@ -365,11 +463,17 @@ def main() -> None:
         raise RuntimeError("tokenizer did not produce a benchmark token")
     base_token_id = candidate_ids[0]
     vocab_size = llm.tokenizer.vocab_size
+    workload_base_token_id = (
+        base_token_id + args.seed * 7919
+    ) % vocab_size
 
-    for warmup_index, prompt_length in enumerate(sorted(set(args.prompt_lengths))):
+    workload_prompt_lengths = sorted(
+        {spec.prompt_length for spec in workload}
+    )
+    for warmup_index, prompt_length in enumerate(workload_prompt_lengths):
         warmup = make_prompt(
-            base_token_id,
-            (base_token_id + 1000 + warmup_index) % vocab_size,
+            workload_base_token_id,
+            (workload_base_token_id + 1000 + warmup_index) % vocab_size,
             prompt_length,
         )
         llm.generate(
@@ -382,8 +486,15 @@ def main() -> None:
             use_tqdm=False,
         )
     if args.prefix_seed_requests:
-        seed_prompt_length = max(args.prompt_lengths)
-        for group in range(args.shared_prefix_groups):
+        seed_prompt_length = max(workload_prompt_lengths)
+        shared_groups = sorted(
+            {
+                spec.shared_prefix_group
+                for spec in workload
+                if spec.shared_prefix_group is not None
+            }
+        )
+        for group in shared_groups:
             for seed_index in range(args.prefix_seed_requests):
                 seed_spec = RequestSpec(
                     request_index=(
@@ -399,7 +510,7 @@ def main() -> None:
                     [
                         build_prompt(
                             seed_spec,
-                            base_token_id,
+                            workload_base_token_id,
                             vocab_size,
                             args.shared_prefix_length,
                         )
@@ -431,7 +542,10 @@ def main() -> None:
             if arrival_ns > now_ns:
                 break
             prompt = build_prompt(
-                spec, base_token_id, vocab_size, args.shared_prefix_length
+                spec,
+                workload_base_token_id,
+                vocab_size,
+                args.shared_prefix_length,
             )
             request_id = llm.add_request(
                 prompt,
@@ -519,6 +633,7 @@ def main() -> None:
 
     duration_s = (benchmark_finished_ns - benchmark_started_ns) / 1e9
     total_output_tokens = sum(request["output_tokens"] for request in requests)
+    total_input_tokens = sum(request["prompt_tokens"] for request in requests)
     ordered_output_tokens = [
         finished_outputs[request_id]
         for request_id, _ in sorted(
@@ -526,6 +641,13 @@ def main() -> None:
             key=lambda item: item[1].request_index,
         )
     ]
+    runtime_metrics = llm.get_runtime_metrics()
+    scheduler_metrics = runtime_metrics["scheduler"]
+    scheduler_cpu_ms = (
+        scheduler_metrics.get("scheduler_admission_decision_ms", 0.0)
+        + scheduler_metrics.get("scheduler_preemption_selection_ms", 0.0)
+        + scheduler_metrics.get("scheduler_metrics_bookkeeping_ms", 0.0)
+    )
     result = {
         "config": vars(args) | {
             "model": str(args.model),
@@ -540,15 +662,22 @@ def main() -> None:
             requests, args.target_ttft_ms, args.target_tpot_ms
         ) | {
             "duration_s": duration_s,
+            "total_makespan_ms": duration_s * 1000,
             "request_throughput_rps": len(requests) / duration_s,
+            "input_throughput_tokens_per_s": total_input_tokens / duration_s,
             "output_throughput_tokens_per_s": total_output_tokens / duration_s,
+            "scheduler_cpu_ms": scheduler_cpu_ms,
+            "scheduler_cpu_fraction": scheduler_cpu_ms / (duration_s * 1000),
             "peak_waiting_requests": peak_waiting,
             "peak_running_requests": peak_running,
             "peak_kv_blocks_used": peak_kv_blocks,
             "peak_allocated_gib": torch.cuda.max_memory_allocated() / 1024**3,
         },
         "breakdown": breakdown,
-        "runtime_metrics": llm.get_runtime_metrics(),
+        "runtime_metrics": runtime_metrics,
+        "scheduler_decision_events": (
+            llm.scheduler.get_scheduler_decision_events()
+        ),
         "workload": [asdict(spec) for spec in workload],
         "requests": requests,
         "output_token_ids": ordered_output_tokens,

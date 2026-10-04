@@ -22,6 +22,12 @@ class Config:
     hybrid_scheduler_max_wait_ms: float = 200.0
     hybrid_scheduler_min_saved_tokens: int = 16
     hybrid_scheduler_preemption_penalty: float = 128.0
+    hybrid_scheduler_score_source: str = "joint"
+    hybrid_scheduler_enable_aging: bool = True
+    hybrid_scheduler_enable_hysteresis: bool = True
+    hybrid_scheduler_enable_sticky_recovery: bool = True
+    enable_scheduler_profiling: bool = False
+    scheduler_decision_history_size: int = 4096
     scheduler_target_ttft_ms: float = 200.0
     scheduler_target_tpot_ms: float = 50.0
     slo_prefill_priority_threshold: float = 0.8
@@ -91,6 +97,10 @@ class Config:
             raise ValueError("minimum saved tokens must be non-negative")
         if self.hybrid_scheduler_preemption_penalty < 0:
             raise ValueError("preemption penalty must be non-negative")
+        if self.hybrid_scheduler_score_source not in ("joint", "kv_only"):
+            raise ValueError("scheduler score source must be joint or kv_only")
+        if self.scheduler_decision_history_size < 0:
+            raise ValueError("scheduler decision history size cannot be negative")
         assert self.scheduler_target_ttft_ms > 0
         assert self.scheduler_target_tpot_ms > 0
         assert self.slo_prefill_priority_threshold > 0

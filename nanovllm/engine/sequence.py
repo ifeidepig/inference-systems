@@ -58,7 +58,12 @@ class Sequence:
         self.scheduler_bypass_count = 0
         self.last_scheduler_score: float | None = None
         self.last_reusable_tokens = 0
+        self.last_kv_candidate_tokens = 0
+        self.last_gdn_checkpoint_tokens = 0
+        self.last_joint_recoverable_tokens = 0
         self.estimated_recompute_tokens_lost = 0
+        self.prefill_tokens_executed = 0
+        self.prefix_tokens_reused = 0
         self.prefix_cache_hit_blocks = 0
         self.peak_kv_blocks = 0
 
@@ -180,9 +185,16 @@ class Sequence:
             "scheduler_bypass_count": self.scheduler_bypass_count,
             "max_wait_rounds": self.max_wait_rounds,
             "last_reusable_tokens": self.last_reusable_tokens,
+            "last_kv_candidate_tokens": self.last_kv_candidate_tokens,
+            "last_gdn_checkpoint_tokens": self.last_gdn_checkpoint_tokens,
+            "last_joint_recoverable_tokens": (
+                self.last_joint_recoverable_tokens
+            ),
             "estimated_recompute_tokens_lost": (
                 self.estimated_recompute_tokens_lost
             ),
+            "prefill_tokens_executed": self.prefill_tokens_executed,
+            "prefix_tokens_reused": self.prefix_tokens_reused,
             "prefix_cache_hit_blocks": self.prefix_cache_hit_blocks,
             "peak_kv_blocks": self.peak_kv_blocks,
         }

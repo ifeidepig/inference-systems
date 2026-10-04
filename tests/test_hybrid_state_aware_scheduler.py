@@ -125,6 +125,24 @@ def test_hysteresis_keeps_feasible_fcfs_head():
     )
 
 
+def test_hysteresis_can_be_disabled_for_ablation():
+    scheduler = Scheduler(
+        _config(
+            hybrid_scheduler_min_saved_tokens=600,
+            hybrid_scheduler_enable_hysteresis=False,
+        )
+    )
+    shared = list(range(512))
+    _seed_prefix(scheduler, shared + [700] * 88)
+    cold = _sequence([900] * 600)
+    warm = _sequence(shared + [701] * 88)
+    scheduler.add(cold)
+    scheduler.add(warm)
+
+    assert scheduler._select_waiting_candidate(NOW_NS) is warm
+    assert scheduler.get_metrics()["hybrid_scheduler_hysteresis_rejections"] == 0
+
+
 def test_aging_deadline_prevents_starvation():
     scheduler = Scheduler(_config(hybrid_scheduler_max_wait_ms=100.0))
     shared = list(range(512))
@@ -137,6 +155,24 @@ def test_aging_deadline_prevents_starvation():
     assert scheduler._select_waiting_candidate(NOW_NS) is overdue
     assert scheduler.last_hybrid_scheduler_decision["reason"] == "aging_deadline"
     assert scheduler.get_metrics()["hybrid_scheduler_aging_overrides"] == 1
+
+
+def test_aging_can_be_disabled_for_ablation():
+    scheduler = Scheduler(
+        _config(
+            hybrid_scheduler_max_wait_ms=100.0,
+            hybrid_scheduler_enable_aging=False,
+        )
+    )
+    shared = list(range(512))
+    _seed_prefix(scheduler, shared + [700] * 88)
+    overdue = _sequence([900] * 600, age_ms=150)
+    warm = _sequence(shared + [701] * 88, age_ms=5)
+    scheduler.add(overdue)
+    scheduler.add(warm)
+
+    assert scheduler._select_waiting_candidate(NOW_NS) is warm
+    assert scheduler.get_metrics()["hybrid_scheduler_aging_overrides"] == 0
 
 
 def test_chunk_continuation_and_preempted_head_are_sticky():
@@ -154,6 +190,25 @@ def test_chunk_continuation_and_preempted_head_are_sticky():
     scheduler.block_manager.deallocate(continuation)
     continuation.preemption_count = 1
     assert scheduler._select_waiting_candidate(NOW_NS) is continuation
+
+
+def test_sticky_recovery_can_be_disabled_for_ablation():
+    scheduler = Scheduler(
+        _config(hybrid_scheduler_enable_sticky_recovery=False)
+    )
+    shared = list(range(512))
+    _seed_prefix(scheduler, shared + [700] * 88)
+    continuation = _sequence([900] * 600)
+    scheduler.block_manager.allocate(continuation, num_cached_blocks=0)
+    continuation.num_cached_tokens = 256
+    warm = _sequence(shared + [701] * 88)
+    scheduler.add(continuation)
+    scheduler.add(warm)
+
+    assert scheduler._select_waiting_candidate(NOW_NS) is warm
+    assert scheduler.get_metrics()[
+        "hybrid_scheduler_sticky_recovery_triggers"
+    ] == 0
 
 
 def test_reclaimable_blocks_excludes_shared_physical_pages():
@@ -276,3 +331,62 @@ def test_hybrid_admission_uses_kv_gdn_intersection_not_kv_only_hit():
         assert probe.uncached_tokens == 5
     finally:
         Sequence.block_size = old_block_size
+
+
+def test_hybrid_kv_only_scoring_is_available_as_safe_ablation():
+    old_block_size = Sequence.block_size
+    Sequence.block_size = 4
+    try:
+        scheduler = Scheduler(
+            _config(
+                kvcache_block_size=4,
+                prefix_match_unit=4,
+                num_kvcache_blocks=12,
+                enable_hybrid_prefix_cache=True,
+                hybrid_prefix_checkpoint_interval_blocks=1,
+                hybrid_scheduler_score_source="kv_only",
+            ),
+            state_manager=SimpleNamespace(can_allocate=True),
+            prefix_checkpoint_pool=SimpleNamespace(capacity=4),
+        )
+        source = _sequence(list(range(9)))
+        scheduler.block_manager.allocate(source, num_cached_blocks=0)
+        source.num_scheduled_tokens = 8
+        scheduler.block_manager.hash_blocks(source)
+        boundary = scheduler.block_manager.prefix_metadata_at_boundary(source, 4)
+        scheduler.block_manager.deallocate(source)
+        scheduler.hybrid_prefix_cache.publish(
+            PendingHybridPrefixCapture(
+                boundary.prefix_hash,
+                4,
+                boundary.tail_block_id,
+                state_slot=0,
+            ),
+            checkpoint_slot=0,
+        )
+        probe = scheduler._admission_probe(
+            _sequence(list(range(8)) + [99]), 0, NOW_NS
+        )
+
+        assert probe.kv_candidate_tokens == 8
+        assert probe.gdn_checkpoint_tokens == 4
+        assert probe.joint_recoverable_tokens == 4
+        assert probe.reusable_tokens == 8
+        # This changes ranking only; actual restore still uses the joint plan.
+    finally:
+        Sequence.block_size = old_block_size
+
+
+def test_scheduler_profiling_exports_latency_and_decision_trace():
+    scheduler = Scheduler(_config(enable_scheduler_profiling=True))
+    first = _sequence([1] * 300)
+    second = _sequence([2] * 300)
+    scheduler.add(first)
+    scheduler.add(second)
+
+    scheduler._select_waiting_candidate(NOW_NS)
+    metrics = scheduler.get_metrics()
+
+    assert metrics["hybrid_scheduler_admission_latency"]["count"] == 1
+    assert metrics["hybrid_scheduler_probe_latency"]["count"] == 1
+    assert scheduler.get_scheduler_decision_events()[0]["type"] == "admission"

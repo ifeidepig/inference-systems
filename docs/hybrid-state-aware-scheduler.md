@@ -76,7 +76,14 @@ checkpoint counts as reusable recovery state.
 --hybrid-scheduler-max-wait-ms 200
 --hybrid-scheduler-min-saved-tokens 16
 --hybrid-scheduler-preemption-penalty 128
+--hybrid-scheduler-score-source joint
+--enable-scheduler-profiling
 ```
+
+Ablation-only switches disable aging, hysteresis, or sticky recovery without
+duplicating scheduler implementations. Detailed decision histories and latency
+samples are enabled only by `--enable-scheduler-profiling`; aggregate counters
+remain available without profiling.
 
 These flags are exposed by `nanovllm-serve` and `benchmark_online.py`.
 
@@ -88,6 +95,13 @@ wait, selected reclaimable pages, estimated recompute tokens, avoided recompute
 relative to LIFO, and victim-selection time. Per-request metrics include bypass
 count, maximum consecutive bypasses, selected reusable tokens, preemption count,
 and estimated recompute tokens lost.
+
+The validation version additionally reports selected KV candidate, GDN
+checkpoint and final joint boundaries separately; original candidate rank;
+hysteresis/sticky/starvation counts; actual scheduled prefill/reused tokens;
+victim computed/logical/reclaimable/recompute values; decision latency
+distributions; and bounded per-decision traces. See
+[serving-benchmark.md](serving-benchmark.md) for the formal matrix.
 
 ## Correctness and fairness coverage
 
@@ -158,15 +172,15 @@ spent 3.21 ms probing across the run.
 | Queue P95 | 8062 ms | 7791 ms | -3.4% |
 | Request throughput | 0.674 req/s | 0.693 req/s | +2.9% |
 
-This is a functional smoke gate, not a resume result: it is one seed, one
-short trace, and two separately initialized engines. The stable claim still
-requires the multi-seed matrix below.
+This remains a historical functional smoke gate, not the final result. The
+five-run matrix below supersedes it.
 
 ## End-to-end experiment matrix
 
-Use `benchmark_online.py` for GPU A/B. Keep the request trace and all model/cache
-settings fixed; change only the two policy flags. Run at least five seeds and
-report median plus P95/IQR rather than a single run.
+The formal GPU A/B uses `benchmark_scheduler_matrix.py`, which invokes the same
+`benchmark_online.py` path for every configuration. It fixes request traces,
+sampling and cache settings, randomizes fresh-engine configuration order, and
+stores five raw runs before aggregation.
 
 Common Qwen3.5 options:
 
@@ -202,11 +216,13 @@ or scheduler overhead erases the saved prefill time.
 
 ## Evidence boundary
 
-The current repository contains a completed implementation, deterministic
-control-plane evidence and an end-to-end harness. Stable 0.8B/9B GPU numbers are
-not claimed until the full seeded matrix is run. Likely negative cases are
-unique prompts, shallow queues, tiny prefixes, and workloads where the cache
-snapshot changes faster than queued decisions can exploit it.
+The completed 0.8B matrix contains 35 main baseline/full comparisons, 60
+ablation comparisons and five focused victim-choice comparisons with no greedy
+digest mismatches. Results are workload-dependent: Low pressure is positive;
+unique prompts are neutral; multi-session, multi-turn and High pressure expose
+no-gain or negative trade-offs. The data does not generalize to 9B, TP/NCCL or
+a fused GDN prefill backend. Full tables and causal analysis are in
+[serving-benchmark.md](serving-benchmark.md).
 
 ## Related upstream designs
 
