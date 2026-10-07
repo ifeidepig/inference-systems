@@ -119,6 +119,7 @@ def run_once(args, num_speculative_tokens: int) -> dict:
         speculative_parallel_verify=args.parallel_verify,
         gdn_decode_backend=args.gdn_decode_backend,
         enable_mtp_phase_profiling=args.phase_profile,
+        enable_mtp_replay_ssm=getattr(args, "replay_ssm", False),
     )
     sampling = SamplingParams(
         temperature=0.0,
@@ -226,6 +227,11 @@ def main() -> None:
     )
     parser.add_argument("--num-speculative-tokens", type=int, default=2)
     parser.add_argument("--phase-profile", action="store_true")
+    parser.add_argument(
+        "--replay-ssm",
+        action="store_true",
+        help="Use compact GDN transition replay for MTP verification.",
+    )
     parser.add_argument(
         "--gdn-decode-backend",
         choices=("torch", "cuda", "auto"),

@@ -257,3 +257,127 @@ def gdn_decode_core(
         key_head_dim,
         value_head_dim,
     )
+
+
+def gdn_replay_commit_torch_(
+    recurrent_states: torch.Tensor,
+    slot_ids: torch.Tensor,
+    replay_keys: torch.Tensor,
+    replay_deltas: torch.Tensor,
+    replay_log_decays: torch.Tensor,
+    commit_lengths: torch.Tensor,
+    num_steps: int,
+) -> torch.Tensor:
+    """Fold compact accepted GDN transitions into active state in place."""
+    batch_size = slot_ids.numel()
+    state = recurrent_states.index_select(1, slot_ids.to(torch.long))
+    keys = replay_keys.view(
+        replay_keys.shape[0],
+        batch_size,
+        num_steps,
+        *replay_keys.shape[2:],
+    ).float()
+    deltas = replay_deltas.view(
+        replay_deltas.shape[0],
+        batch_size,
+        num_steps,
+        *replay_deltas.shape[2:],
+    ).float()
+    log_decays = replay_log_decays.view(
+        replay_log_decays.shape[0],
+        batch_size,
+        num_steps,
+        *replay_log_decays.shape[2:],
+    ).float()
+    lengths = commit_lengths.to(device=state.device, dtype=torch.long)
+    for step in range(num_steps):
+        retain = (
+            log_decays[:, :, step].exp().unsqueeze(-1).unsqueeze(-1)
+        )
+        updated = state * retain + torch.einsum(
+            "lbhd,lbhv->lbhdv",
+            keys[:, :, step],
+            deltas[:, :, step],
+        )
+        state = torch.where(
+            (lengths > step).view(1, batch_size, 1, 1, 1),
+            updated,
+            state,
+        )
+    recurrent_states.index_copy_(1, slot_ids.to(torch.long), state)
+    return recurrent_states
+
+
+def gdn_replay_commit_(
+    recurrent_states: torch.Tensor,
+    slot_ids: torch.Tensor,
+    replay_keys: torch.Tensor,
+    replay_deltas: torch.Tensor,
+    replay_log_decays: torch.Tensor,
+    commit_lengths: torch.Tensor,
+    num_steps: int,
+) -> torch.Tensor:
+    """Use the fused CUDA replay fold when available, else the Torch oracle."""
+    if recurrent_states.is_cuda and _cuda_op_available():
+        try:
+            op = getattr(torch.ops.nanovllm, "gdn_replay_commit")
+        except AttributeError:
+            pass
+        else:
+            return op(
+                recurrent_states,
+                slot_ids.to(device=recurrent_states.device, dtype=torch.long),
+                replay_keys.contiguous(),
+                replay_deltas.contiguous(),
+                replay_log_decays.contiguous(),
+                commit_lengths.to(
+                    device=recurrent_states.device,
+                    dtype=torch.long,
+                ),
+                num_steps,
+            )
+    return gdn_replay_commit_torch_(
+        recurrent_states,
+        slot_ids,
+        replay_keys,
+        replay_deltas,
+        replay_log_decays,
+        commit_lengths,
+        num_steps,
+    )
+
+
+def gdn_conv_commit_(
+    conv_states: torch.Tensor,
+    conv_history: torch.Tensor,
+    slot_ids: torch.Tensor,
+    state_boundaries: torch.Tensor,
+    num_steps: int,
+) -> torch.Tensor:
+    """Select and commit one compact conv window per request."""
+    slots = slot_ids.to(device=conv_states.device, dtype=torch.long)
+    boundaries = state_boundaries.to(
+        device=conv_states.device,
+        dtype=torch.long,
+    )
+    if conv_states.is_cuda and _cuda_op_available():
+        try:
+            op = getattr(torch.ops.nanovllm, "gdn_conv_commit")
+        except AttributeError:
+            pass
+        else:
+            return op(
+                conv_states,
+                conv_history.contiguous(),
+                slots,
+                boundaries,
+                num_steps,
+            )
+    batch_size = slots.numel()
+    history_indices = (
+        torch.arange(batch_size, device=conv_states.device) * num_steps
+        + boundaries
+    )
+    selected = conv_history.index_select(1, history_indices)
+    conv_states.index_copy_(1, slots, selected)
+    return conv_states

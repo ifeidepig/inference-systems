@@ -51,6 +51,7 @@ class Config:
     num_speculative_tokens: int = 0
     speculative_parallel_verify: bool = True
     enable_mtp_phase_profiling: bool = False
+    enable_mtp_replay_ssm: bool = False
     gdn_decode_backend: str = "torch"
     enable_hybrid_prefix_cache: bool = False
     hybrid_prefix_checkpoint_interval_blocks: int = 8
@@ -151,6 +152,11 @@ class Config:
                 raise ValueError("native MTP currently requires Qwen3.5 hybrid state")
             if self.model_capabilities.mtp_num_hidden_layers != 1:
                 raise ValueError("native MTP requires exactly one checkpoint MTP layer")
+        if self.enable_mtp_replay_ssm:
+            if not self.num_speculative_tokens:
+                raise ValueError("MTP ReplaySSM requires speculative decoding")
+            if not self.speculative_parallel_verify:
+                raise ValueError("MTP ReplaySSM requires parallel verification")
         if self.enable_hybrid_prefix_cache:
             if self.enable_hybrid_internal_checkpoints and self.max_num_seqs != 1:
                 raise ValueError(

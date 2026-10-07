@@ -16,12 +16,20 @@ from torch.profiler import record_function
 
 
 @dataclass(frozen=True)
+class GatedDeltaReplayRecords:
+    key: torch.Tensor
+    delta: torch.Tensor
+    log_decay: torch.Tensor
+
+
+@dataclass(frozen=True)
 class GatedDeltaCoreOutput:
     output: torch.Tensor
     conv_state: torch.Tensor
     recurrent_state: torch.Tensor
     conv_state_history: torch.Tensor | None = None
     recurrent_state_history: torch.Tensor | None = None
+    replay_records: GatedDeltaReplayRecords | None = None
 
 
 def _l2_normalize(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -144,6 +152,7 @@ def recurrent_gated_delta_reference(
     normalize_qk: bool = True,
     return_state_history: bool = False,
     checkpoint_indices: tuple[int, ...] | None = None,
+    return_replay_records: bool = False,
     profile_state_history: bool = False,
 ):
     """Run the gated delta rule as an explicit token-by-token FP32 scan.
@@ -193,6 +202,9 @@ def recurrent_gated_delta_reference(
 
     outputs = []
     state_history = []
+    replay_keys = []
+    replay_deltas = []
+    replay_log_decays = []
     for token_idx in range(sequence_length):
         q_t = q[:, token_idx]
         k_t = k[:, token_idx]
@@ -205,6 +217,10 @@ def recurrent_gated_delta_reference(
         delta = (v_t - predicted_value) * update_rate[:, token_idx].unsqueeze(-1)
         state = state + torch.einsum("bhd,bhv->bhdv", k_t, delta)
         outputs.append(torch.einsum("bhd,bhdv->bhv", q_t, state))
+        if return_replay_records:
+            replay_keys.append(k_t)
+            replay_deltas.append(delta)
+            replay_log_decays.append(decay[:, token_idx])
         if capture_states and (
             return_state_history or token_idx in checkpoint_set
         ):
@@ -220,6 +236,13 @@ def recurrent_gated_delta_reference(
         output = torch.stack(outputs, dim=1)
     else:
         output = v.new_empty((batch_size, 0, num_heads, value_head_dim))
+    records = None
+    if return_replay_records:
+        records = GatedDeltaReplayRecords(
+            key=torch.stack(replay_keys, dim=1),
+            delta=torch.stack(replay_deltas, dim=1),
+            log_decay=torch.stack(replay_log_decays, dim=1),
+        )
     if capture_states:
         context = (
             record_function("gdn.history.recurrent.stack")
@@ -232,7 +255,11 @@ def recurrent_gated_delta_reference(
                 if state_history
                 else state[:, None, ...][:, :0]
             )
+        if records is not None:
+            return output, state, history, records
         return output, state, history
+    if records is not None:
+        return output, state, records
     return output, state
 
 
@@ -252,6 +279,7 @@ def gated_delta_core_reference(
     recurrent_state: torch.Tensor | None = None,
     return_state_history: bool = False,
     checkpoint_indices: tuple[int, ...] | None = None,
+    return_replay_records: bool = False,
     profile_state_history: bool = False,
 ) -> GatedDeltaCoreOutput:
     """Reference the convolution + recurrent core before z-gated output.
@@ -282,12 +310,20 @@ def gated_delta_core_reference(
         projected_qkv,
         conv_weight,
         conv_state,
-        return_state_history=return_state_history,
-        checkpoint_indices=checkpoint_indices,
+        return_state_history=(
+            return_state_history or return_replay_records
+        ),
+        checkpoint_indices=(
+            None if return_replay_records else checkpoint_indices
+        ),
         profile_state_history=profile_state_history,
     )
-    capture_states = return_state_history or checkpoint_indices is not None
-    if capture_states:
+    capture_conv_states = (
+        return_state_history
+        or checkpoint_indices is not None
+        or return_replay_records
+    )
+    if capture_conv_states:
         mixed_qkv, final_conv_state, conv_state_history = conv_result
     else:
         mixed_qkv, final_conv_state = conv_result
@@ -318,10 +354,25 @@ def gated_delta_core_reference(
         recurrent_state,
         return_state_history=return_state_history,
         checkpoint_indices=checkpoint_indices,
+        return_replay_records=return_replay_records,
         profile_state_history=profile_state_history,
     )
-    if capture_states:
+    capture_recurrent_states = (
+        return_state_history or checkpoint_indices is not None
+    )
+    replay_records = None
+    if capture_recurrent_states and return_replay_records:
+        (
+            output,
+            final_recurrent_state,
+            recurrent_state_history,
+            replay_records,
+        ) = recurrent_result
+    elif capture_recurrent_states:
         output, final_recurrent_state, recurrent_state_history = recurrent_result
+    elif return_replay_records:
+        output, final_recurrent_state, replay_records = recurrent_result
+        recurrent_state_history = None
     else:
         output, final_recurrent_state = recurrent_result
         recurrent_state_history = None
@@ -331,4 +382,5 @@ def gated_delta_core_reference(
         recurrent_state=final_recurrent_state,
         conv_state_history=conv_state_history,
         recurrent_state_history=recurrent_state_history,
+        replay_records=replay_records,
     )

@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
+import pytest
 from safetensors.torch import save_file
 
 from nanovllm import SamplingParams
@@ -418,6 +419,7 @@ def test_model_runner_mtp_matches_target_with_acceptance_and_rejection(tmp_path)
         num_speculative_tokens,
         parallel_verify=False,
         cuda_graph=False,
+        replay_ssm=False,
     ):
         return SimpleNamespace(
             model=str(tmp_path),
@@ -434,6 +436,7 @@ def test_model_runner_mtp_matches_target_with_acceptance_and_rejection(tmp_path)
             max_num_kvcache_blocks=2,
             num_speculative_tokens=num_speculative_tokens,
             speculative_parallel_verify=parallel_verify,
+            enable_mtp_replay_ssm=replay_ssm,
             gdn_decode_backend="torch",
         )
 
@@ -480,6 +483,47 @@ def test_model_runner_mtp_matches_target_with_acceptance_and_rejection(tmp_path)
         make_config(4, parallel_verify=True, cuda_graph=True),
         num_tokens=8,
     )
+    replay_eager, _ = _generate_tiny_greedy(
+        make_config(2, parallel_verify=True, replay_ssm=True),
+        num_tokens=8,
+    )
+    replay_graph, _ = _generate_tiny_greedy(
+        make_config(
+            2,
+            parallel_verify=True,
+            cuda_graph=True,
+            replay_ssm=True,
+        ),
+        num_tokens=8,
+    )
+    replay_graph_rejected, _ = _generate_tiny_greedy(
+        make_config(
+            2,
+            parallel_verify=True,
+            cuda_graph=True,
+            replay_ssm=True,
+        ),
+        num_tokens=8,
+        zero_mtp=True,
+    )
+    replay_graph_k1, _ = _generate_tiny_greedy(
+        make_config(
+            1,
+            parallel_verify=True,
+            cuda_graph=True,
+            replay_ssm=True,
+        ),
+        num_tokens=8,
+    )
+    replay_graph_k4, _ = _generate_tiny_greedy(
+        make_config(
+            4,
+            parallel_verify=True,
+            cuda_graph=True,
+            replay_ssm=True,
+        ),
+        num_tokens=8,
+    )
 
     assert speculative == expected
     assert rejected == expected
@@ -492,12 +536,21 @@ def test_model_runner_mtp_matches_target_with_acceptance_and_rejection(tmp_path)
     assert graphed_k1 == expected
     assert parallel_k4 == expected
     assert graphed_k4 == expected
+    assert replay_eager == expected
+    assert replay_graph == expected
+    assert replay_graph_rejected == expected
+    assert replay_graph_k1 == expected
+    assert replay_graph_k4 == expected
     assert normal_rounds
     assert rejection_rounds
     assert all(len(tokens) >= 2 for tokens in rejection_rounds)
 
 
-def test_model_runner_mtp_continuous_batch_commits_variable_acceptance(tmp_path):
+@pytest.mark.parametrize("replay_ssm", [False, True])
+def test_model_runner_mtp_continuous_batch_commits_variable_acceptance(
+    tmp_path,
+    replay_ssm,
+):
     if not torch.cuda.is_available():
         return
     text_config, capabilities = _full_config()
@@ -508,7 +561,11 @@ def test_model_runner_mtp_continuous_batch_commits_variable_acceptance(tmp_path)
         include_mtp=True,
     )
 
-    def make_config(num_speculative_tokens, max_num_seqs=1):
+    def make_config(
+        num_speculative_tokens,
+        max_num_seqs=1,
+        enable_replay=False,
+    ):
         return SimpleNamespace(
             model=str(tmp_path),
             hf_config=text_config,
@@ -524,6 +581,7 @@ def test_model_runner_mtp_continuous_batch_commits_variable_acceptance(tmp_path)
             max_num_kvcache_blocks=4,
             num_speculative_tokens=num_speculative_tokens,
             speculative_parallel_verify=True,
+            enable_mtp_replay_ssm=enable_replay,
             gdn_decode_backend="torch",
             enable_mtp_phase_profiling=True,
         )
@@ -535,7 +593,11 @@ def test_model_runner_mtp_continuous_batch_commits_variable_acceptance(tmp_path)
         make_config(0), num_tokens=10, prompt=(4, 5)
     )
 
-    runner = ModelRunner(make_config(2, 2), rank=0, event=[])
+    runner = ModelRunner(
+        make_config(2, 2, replay_ssm),
+        rank=0,
+        event=[],
+    )
     try:
         sequences = [
             Sequence(
@@ -587,18 +649,31 @@ def test_model_runner_mtp_continuous_batch_commits_variable_acceptance(tmp_path)
         assert outputs[0] == expected_a[1:4]
         assert outputs[1] == expected_b[1:3]
         phase_profile = runner.get_metrics()["mtp_phase_profile"]
-        assert phase_profile["counters"]["state_active_reuse_rows"] == 1
-        assert phase_profile["counters"]["state_rollback_rows"] == 1
         state_bytes = runner.state_manager.bytes_per_slot()
-        assert phase_profile["counters"][
-            "state_history_materialized_bytes"
-        ] == state_bytes * 2
-        assert phase_profile["counters"][
-            "state_history_dense_equivalent_bytes"
-        ] == state_bytes * 2 * 2
-        assert phase_profile["counters"][
-            "state_history_final_boundary_avoided_bytes"
-        ] == state_bytes * 2
+        if replay_ssm:
+            recurrent_bytes = (
+                runner.state_manager.recurrent_states[:, 0].numel()
+                * runner.state_manager.recurrent_states.element_size()
+            )
+            assert phase_profile["counters"]["replay_commit_rows"] == 2
+            assert phase_profile["counters"][
+                "recurrent_history_avoided_bytes"
+            ] == recurrent_bytes * 2
+            assert phase_profile["counters"][
+                "replay_record_materialized_bytes"
+            ] > 0
+        else:
+            assert phase_profile["counters"]["state_active_reuse_rows"] == 1
+            assert phase_profile["counters"]["state_rollback_rows"] == 1
+            assert phase_profile["counters"][
+                "state_history_materialized_bytes"
+            ] == state_bytes * 2
+            assert phase_profile["counters"][
+                "state_history_dense_equivalent_bytes"
+            ] == state_bytes * 2 * 2
+            assert phase_profile["counters"][
+                "state_history_final_boundary_avoided_bytes"
+            ] == state_bytes * 2
         assert phase_profile["counters"][
             "final_alignment_lm_head_skipped"
         ] == 2

@@ -31,6 +31,7 @@ setup(
                 str(CSRC / "add_kernel.cu"),
                 str(CSRC / "fused_add_rmsnorm_kernel.cu"),
                 str(CSRC / "gdn_decode_kernel.cu"),
+                str(CSRC / "gdn_replay_kernel.cu"),
             ],
             include_dirs=cuda_include_paths(),
             extra_compile_args={

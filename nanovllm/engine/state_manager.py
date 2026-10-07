@@ -4,6 +4,8 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 
+from nanovllm.kernels.gdn import gdn_conv_commit_, gdn_replay_commit_
+
 
 @dataclass(frozen=True, slots=True)
 class HybridStateSnapshot:
@@ -139,6 +141,105 @@ class HybridStateManager:
                 slot_ids,
                 conv.to(self.conv_states.dtype),
             )
+
+    def scatter_conv(
+        self,
+        slot_ids: torch.Tensor,
+        conv_by_layer: list[torch.Tensor | None],
+        *,
+        linear_layer_indices: tuple[int, ...] | list[int],
+    ) -> None:
+        """Commit only the selected short-convolution windows."""
+        if len(linear_layer_indices) != self.num_linear_layers:
+            raise ValueError("linear layer index count does not match state pool")
+        slot_ids = slot_ids.to(device=self.conv_states.device, dtype=torch.long)
+        for compact_index, layer_index in enumerate(linear_layer_indices):
+            conv = conv_by_layer[layer_index]
+            if conv is None:
+                raise ValueError(
+                    f"missing updated conv state for linear layer {layer_index}"
+                )
+            self.conv_states[compact_index].index_copy_(
+                0,
+                slot_ids,
+                conv.to(self.conv_states.dtype),
+            )
+
+    def replay_recurrent(
+        self,
+        slot_ids: torch.Tensor,
+        replay_keys: torch.Tensor,
+        replay_deltas: torch.Tensor,
+        replay_log_decays: torch.Tensor,
+        commit_lengths: torch.Tensor,
+        *,
+        num_steps: int,
+    ) -> None:
+        """Replay compact GDN transitions into each request's active state.
+
+        The active recurrent slot remains the pre-verify checkpoint while the
+        verifier records normalized keys, delta vectors and log decays.  This
+        method folds only the accepted prefix and writes one final recurrent
+        state per request, avoiding per-draft full-state snapshots.
+        """
+        if num_steps <= 0:
+            raise ValueError("replay requires at least one transition")
+        slot_ids = slot_ids.to(
+            device=self.recurrent_states.device,
+            dtype=torch.long,
+        )
+        commit_lengths = commit_lengths.to(
+            device=self.recurrent_states.device,
+            dtype=torch.long,
+        )
+        batch_size = slot_ids.numel()
+        if commit_lengths.shape != (batch_size,):
+            raise ValueError("commit_lengths must have one value per slot")
+        if (
+            not commit_lengths.is_cuda
+            and bool(((commit_lengths < 1) | (commit_lengths > num_steps)).any())
+        ):
+            raise ValueError("commit length is outside the replay window")
+
+        expected_rows = batch_size * num_steps
+        if replay_keys.shape[:2] != (self.num_linear_layers, expected_rows):
+            raise ValueError("replay key shape does not match layers x batch x steps")
+        if replay_deltas.shape[:2] != (self.num_linear_layers, expected_rows):
+            raise ValueError("replay delta shape does not match layers x batch x steps")
+        if replay_log_decays.shape[:2] != (
+            self.num_linear_layers,
+            expected_rows,
+        ):
+            raise ValueError("replay decay shape does not match layers x batch x steps")
+
+        gdn_replay_commit_(
+            self.recurrent_states,
+            slot_ids,
+            replay_keys,
+            replay_deltas,
+            replay_log_decays,
+            commit_lengths,
+            num_steps,
+        )
+
+    def commit_conv_history(
+        self,
+        slot_ids: torch.Tensor,
+        conv_history: torch.Tensor,
+        state_boundaries: torch.Tensor,
+        *,
+        num_steps: int,
+    ) -> None:
+        """Commit accepted conv windows with one fused layer-batch launch."""
+        if conv_history.shape[0] != self.num_linear_layers:
+            raise ValueError("conv history layer count does not match state pool")
+        gdn_conv_commit_(
+            self.conv_states,
+            conv_history,
+            slot_ids,
+            state_boundaries,
+            num_steps,
+        )
 
     def reset_scratch(self) -> None:
         self._zero_slot(self.scratch_slot_id)

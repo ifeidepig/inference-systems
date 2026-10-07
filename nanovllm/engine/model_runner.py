@@ -73,6 +73,9 @@ class ModelRunner:
         self.speculative_parallel_verify = getattr(
             config, "speculative_parallel_verify", False
         )
+        self.enable_mtp_replay_ssm = bool(
+            getattr(config, "enable_mtp_replay_ssm", False)
+        )
         self.mtp = None
         if self.num_speculative_tokens:
             self.mtp = Qwen3_5MTP(
@@ -358,6 +361,8 @@ class ModelRunner:
         all_logits: bool = False,
         return_state_history: bool = False,
         state_checkpoint_indices: tuple[int, ...] | None = None,
+        return_replay_records: bool = False,
+        commit_states: bool = True,
     ):
         """Run target eagerly and expose hidden states for the MTP drafter."""
         context = get_context()
@@ -388,11 +393,23 @@ class ModelRunner:
             conv_states,
             return_state_history=return_state_history,
             state_checkpoint_indices=state_checkpoint_indices,
+            return_replay_records=return_replay_records,
         )
         capture_states = (
             return_state_history or state_checkpoint_indices is not None
         )
-        if capture_states:
+        if return_replay_records:
+            (
+                hidden_states,
+                new_recurrent_states,
+                new_conv_states,
+                recurrent_histories,
+                conv_histories,
+                replay_keys,
+                replay_deltas,
+                replay_log_decays,
+            ) = model_result
+        elif capture_states:
             (
                 hidden_states,
                 new_recurrent_states,
@@ -402,14 +419,23 @@ class ModelRunner:
             ) = model_result
         else:
             hidden_states, new_recurrent_states, new_conv_states = model_result
-        self.state_manager.scatter(
-            context.state_slot_ids,
-            new_recurrent_states,
-            new_conv_states,
-            linear_layer_indices=linear_indices,
-        )
+        if commit_states:
+            self.state_manager.scatter(
+                context.state_slot_ids,
+                new_recurrent_states,
+                new_conv_states,
+                linear_layer_indices=linear_indices,
+            )
         if not compute_logits:
             result = hidden_states, None
+            if return_replay_records:
+                return result + (
+                    recurrent_histories,
+                    conv_histories,
+                    replay_keys,
+                    replay_deltas,
+                    replay_log_decays,
+                )
             if capture_states:
                 return result + (recurrent_histories, conv_histories)
             return result
@@ -419,6 +445,14 @@ class ModelRunner:
         logits = self.model.compute_logits(hidden_states)
         context.is_prefill = old_is_prefill
         result = hidden_states, logits
+        if return_replay_records:
+            return result + (
+                recurrent_histories,
+                conv_histories,
+                replay_keys,
+                replay_deltas,
+                replay_log_decays,
+            )
         if capture_states:
             return result + (recurrent_histories, conv_histories)
         return result
@@ -804,6 +838,20 @@ class ModelRunner:
         num_layers = len(self.model.model.layers)
         recurrent_histories = [None] * num_layers
         conv_histories = [None] * num_layers
+        replay_keys = [None] * num_layers
+        replay_deltas = [None] * num_layers
+        replay_log_decays = [None] * num_layers
+        replay_ssm = variables["replay_ssm"]
+        if replay_ssm:
+            self.speculative_verify_cudagraph_replays += 1
+            return (
+                hidden_states,
+                logits,
+                variables["conv_history"][:, :num_tokens],
+                variables["replay_key"][:, :num_tokens],
+                variables["replay_delta"][:, :num_tokens],
+                variables["replay_log_decay"][:, :num_tokens],
+            )
         history_steps = variables["history_steps"]
         if history_steps:
             num_history_tokens = batch_size * history_steps
@@ -1316,18 +1364,67 @@ class ModelRunner:
                     and hasattr(self, "verify_graphs")
                     and batch_size in self.verify_graphs
                 ):
-                    (
-                        all_hidden,
-                        all_logits,
-                        recurrent_histories,
-                        conv_histories,
-                    ) = self._replay_verify_graph(
+                    graph_result = self._replay_verify_graph(
                         verify_ids,
                         verify_positions,
                         batch_size,
                     )
+                    if self.enable_mtp_replay_ssm:
+                        (
+                            all_hidden,
+                            all_logits,
+                            conv_histories,
+                            replay_keys,
+                            replay_deltas,
+                            replay_log_decays,
+                        ) = graph_result
+                    else:
+                        (
+                            all_hidden,
+                            all_logits,
+                            recurrent_histories,
+                            conv_histories,
+                        ) = graph_result
                 else:
-                    if rollback_history_steps:
+                    if self.enable_mtp_replay_ssm:
+                        (
+                            all_hidden,
+                            all_logits,
+                            _,
+                            conv_histories,
+                            replay_keys,
+                            replay_deltas,
+                            replay_log_decays,
+                        ) = self._forward_target_eager(
+                            verify_ids,
+                            verify_positions,
+                            all_logits=True,
+                            return_replay_records=True,
+                            commit_states=False,
+                        )
+                        linear_indices = (
+                            self.model.model.linear_attention_layer_indices
+                        )
+                        conv_histories = torch.stack(
+                            [conv_histories[index] for index in linear_indices],
+                            dim=0,
+                        )
+                        replay_keys = torch.stack(
+                            [replay_keys[index] for index in linear_indices],
+                            dim=0,
+                        )
+                        replay_deltas = torch.stack(
+                            [replay_deltas[index] for index in linear_indices],
+                            dim=0,
+                        )
+                        replay_log_decays = torch.stack(
+                            [
+                                replay_log_decays[index]
+                                for index in linear_indices
+                            ],
+                            dim=0,
+                        )
+                    elif rollback_history_steps:
                         (
                             all_hidden,
                             all_logits,
@@ -1420,7 +1517,57 @@ class ModelRunner:
             state_boundaries = accepted_lengths.clamp_max(
                 self.num_speculative_tokens - 1
             )
-        if self.speculative_parallel_verify:
+        if self.speculative_parallel_verify and self.enable_mtp_replay_ssm:
+            with self.mtp_phase_profiler.phase("mtp.replay_commit"):
+                commit_lengths = state_boundaries.to(torch.long) + 1
+                self.state_manager.replay_recurrent(
+                    target_state_slot_ids,
+                    replay_keys,
+                    replay_deltas,
+                    replay_log_decays,
+                    commit_lengths,
+                    num_steps=self.num_speculative_tokens,
+                )
+            with self.mtp_phase_profiler.phase("mtp.conv_state_commit"):
+                self.state_manager.commit_conv_history(
+                    target_state_slot_ids,
+                    conv_histories,
+                    state_boundaries,
+                    num_steps=self.num_speculative_tokens,
+                )
+            conv_history_bytes = (
+                conv_histories.numel() * conv_histories.element_size()
+            )
+            replay_record_bytes = sum(
+                record.numel() * record.element_size()
+                for record in (
+                    replay_keys,
+                    replay_deltas,
+                    replay_log_decays,
+                )
+            )
+            recurrent_bytes_per_slot = (
+                self.state_manager.recurrent_states[:, 0].numel()
+                * self.state_manager.recurrent_states.element_size()
+            )
+            self.mtp_phase_profiler.add_counter(
+                "state_history_materialized_bytes",
+                conv_history_bytes,
+            )
+            self.mtp_phase_profiler.add_counter(
+                "replay_record_materialized_bytes",
+                replay_record_bytes,
+            )
+            self.mtp_phase_profiler.add_counter(
+                "recurrent_history_avoided_bytes",
+                recurrent_bytes_per_slot
+                * batch_size
+                * max(self.num_speculative_tokens - 1, 0),
+            )
+            self.mtp_phase_profiler.add_counter(
+                "replay_commit_rows", batch_size
+            )
+        elif self.speculative_parallel_verify:
             with self.mtp_phase_profiler.phase("mtp.state_select"):
                 # Verify has already committed the state after its final input
                 # token to each request's active slot. Keep that state in place
@@ -1593,6 +1740,23 @@ class ModelRunner:
                 "verify_graph_history_capacity_bytes",
                 graph_history_bytes,
             )
+            replay_record_capacity_bytes = sum(
+                self.verify_graph_vars[name].numel()
+                * self.verify_graph_vars[name].element_size()
+                for name in (
+                    "replay_key",
+                    "replay_delta",
+                    "replay_log_decay",
+                )
+            )
+            self.mtp_phase_profiler.set_counter(
+                "verify_graph_replay_record_capacity_bytes",
+                replay_record_capacity_bytes,
+            )
+            self.mtp_phase_profiler.set_counter(
+                "verify_graph_total_spec_state_capacity_bytes",
+                graph_history_bytes + replay_record_capacity_bytes,
+            )
             dense_graph_history_bytes = (
                 self.state_manager.bytes_per_slot()
                 * max(self.graph_bs)
@@ -1604,7 +1768,24 @@ class ModelRunner:
             )
             self.mtp_phase_profiler.set_counter(
                 "verify_graph_history_capacity_saved_bytes",
-                dense_graph_history_bytes - graph_history_bytes,
+                dense_graph_history_bytes
+                - graph_history_bytes
+                - replay_record_capacity_bytes,
+            )
+            minimal_snapshot_capacity_bytes = (
+                self.state_manager.bytes_per_slot()
+                * max(self.graph_bs)
+                * max(self.num_speculative_tokens - 1, 0)
+            )
+            self.mtp_phase_profiler.set_counter(
+                "verify_graph_minimal_snapshot_capacity_bytes",
+                minimal_snapshot_capacity_bytes,
+            )
+            self.mtp_phase_profiler.set_counter(
+                "verify_graph_replay_savings_vs_minimal_bytes",
+                minimal_snapshot_capacity_bytes
+                - graph_history_bytes
+                - replay_record_capacity_bytes,
             )
         self.mtp_phase_profiler.flush()
         reset_context()
@@ -1799,10 +1980,14 @@ class ModelRunner:
         """Capture fixed-width parallel target verification buckets."""
         max_bs = max(self.graph_bs)
         steps = self.num_speculative_tokens
-        history_steps = max(steps - 1, 0)
+        replay_ssm = self.enable_mtp_replay_ssm
+        history_steps = 0 if replay_ssm else max(steps - 1, 0)
         rollback_checkpoint_indices = tuple(range(history_steps))
         max_tokens = max_bs * steps
         max_history_tokens = max_bs * history_steps
+        max_conv_history_tokens = (
+            max_tokens if replay_ssm else max_history_tokens
+        )
         max_num_blocks = (
             self.config.max_model_len + self.block_size - 1
         ) // self.block_size
@@ -1845,10 +2030,30 @@ class ModelRunner:
         )
         conv_history = torch.zeros(
             self.state_manager.num_linear_layers,
-            max_history_tokens,
+            max_conv_history_tokens,
             reference_layer.conv_dim,
             reference_layer.conv_kernel_size - 1,
             dtype=hf_config.dtype,
+        )
+        replay_key = torch.zeros(
+            self.state_manager.num_linear_layers,
+            max_tokens if replay_ssm else 0,
+            reference_layer.num_value_heads,
+            reference_layer.key_head_dim,
+            dtype=torch.float32,
+        )
+        replay_delta = torch.zeros(
+            self.state_manager.num_linear_layers,
+            max_tokens if replay_ssm else 0,
+            reference_layer.num_value_heads,
+            reference_layer.value_head_dim,
+            dtype=torch.float32,
+        )
+        replay_log_decay = torch.zeros(
+            self.state_manager.num_linear_layers,
+            max_tokens if replay_ssm else 0,
+            reference_layer.num_value_heads,
+            dtype=torch.float32,
         )
         self.verify_graph_vars = {
             "input_ids": input_ids,
@@ -1862,6 +2067,10 @@ class ModelRunner:
             "recurrent_history": recurrent_history,
             "conv_history": conv_history,
             "history_steps": history_steps,
+            "replay_ssm": replay_ssm,
+            "replay_key": replay_key,
+            "replay_delta": replay_delta,
+            "replay_log_decay": replay_log_decay,
         }
         self.verify_graphs = {}
         num_layers = len(self.model.model.layers)
@@ -1889,7 +2098,25 @@ class ModelRunner:
                     num_total_layers=num_layers,
                     linear_layer_indices=linear_indices,
                 )
-                if history_steps:
+                if replay_ssm:
+                    (
+                        hidden_states,
+                        _,
+                        _,
+                        _,
+                        conv_histories,
+                        replay_keys,
+                        replay_deltas,
+                        replay_log_decays,
+                    ) = self.model(
+                        input_ids[:num_tokens],
+                        positions[:num_tokens],
+                        cu_q,
+                        recurrent_states,
+                        conv_states,
+                        return_replay_records=True,
+                    )
+                elif history_steps:
                     (
                         hidden_states,
                         new_recurrent_states,
@@ -1919,13 +2146,30 @@ class ModelRunner:
                         conv_states,
                     )
                 outputs[:num_tokens] = hidden_states
-                self.state_manager.scatter(
-                    slots,
-                    new_recurrent_states,
-                    new_conv_states,
-                    linear_layer_indices=linear_indices,
-                )
-                if history_steps:
+                if not replay_ssm:
+                    self.state_manager.scatter(
+                        slots,
+                        new_recurrent_states,
+                        new_conv_states,
+                        linear_layer_indices=linear_indices,
+                    )
+                if replay_ssm:
+                    for compact_index, layer_index in enumerate(
+                        linear_indices
+                    ):
+                        conv_history[
+                            compact_index, :num_tokens
+                        ] = conv_histories[layer_index]
+                        replay_key[
+                            compact_index, :num_tokens
+                        ] = replay_keys[layer_index]
+                        replay_delta[
+                            compact_index, :num_tokens
+                        ] = replay_deltas[layer_index]
+                        replay_log_decay[
+                            compact_index, :num_tokens
+                        ] = replay_log_decays[layer_index]
+                elif history_steps:
                     for compact_index, layer_index in enumerate(
                         linear_indices
                     ):

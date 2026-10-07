@@ -56,7 +56,7 @@ class Qwen3_5MTP(nn.Module):
         hidden_states = self.fc(
             torch.cat((embeddings, target_hidden_states), dim=-1)
         )
-        hidden_states, residual, _, _, _, _ = self.layers[0](
+        hidden_states, residual, _, _, _, _, _, _, _ = self.layers[0](
             positions,
             hidden_states,
             None,

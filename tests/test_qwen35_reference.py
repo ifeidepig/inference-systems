@@ -39,6 +39,7 @@ def _run_slice(
     *,
     return_state_history=False,
     checkpoint_indices=None,
+    return_replay_records=False,
 ):
     return gated_delta_core_reference(
         inputs["projected_qkv"][:, start:end],
@@ -55,6 +56,7 @@ def _run_slice(
         recurrent_state=recurrent_state,
         return_state_history=return_state_history,
         checkpoint_indices=checkpoint_indices,
+        return_replay_records=return_replay_records,
     )
 
 
@@ -188,6 +190,60 @@ def test_sparse_internal_checkpoints_match_full_history_and_split_prefill():
     torch.testing.assert_close(
         sparse.recurrent_state_history[:, 1],
         split_at_five.recurrent_state,
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+
+def test_compact_replay_records_reconstruct_every_boundary():
+    inputs = _make_inputs(sequence_length=4)
+    torch.manual_seed(19)
+    initial = torch.randn(1, 4, 3, 2)
+    full = _run_slice(
+        inputs,
+        0,
+        4,
+        recurrent_state=initial,
+        return_state_history=True,
+    )
+    compact = _run_slice(
+        inputs,
+        0,
+        4,
+        recurrent_state=initial,
+        return_replay_records=True,
+    )
+
+    assert compact.recurrent_state_history is None
+    assert compact.conv_state_history.shape == (1, 4, 20, 3)
+    records = compact.replay_records
+    assert records.key.shape == (1, 4, 4, 3)
+    assert records.delta.shape == (1, 4, 4, 2)
+    assert records.log_decay.shape == (1, 4, 4)
+
+    replayed = initial.clone()
+    for step in range(4):
+        replayed = (
+            replayed
+            * records.log_decay[:, step]
+            .exp()
+            .unsqueeze(-1)
+            .unsqueeze(-1)
+            + torch.einsum(
+                "bhd,bhv->bhdv",
+                records.key[:, step],
+                records.delta[:, step],
+            )
+        )
+        torch.testing.assert_close(
+            replayed,
+            full.recurrent_state_history[:, step],
+            rtol=1e-5,
+            atol=1e-5,
+        )
+    torch.testing.assert_close(
+        compact.recurrent_state,
+        full.recurrent_state,
         rtol=1e-5,
         atol=1e-5,
     )

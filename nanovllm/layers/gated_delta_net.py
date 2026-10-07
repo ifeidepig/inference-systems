@@ -163,6 +163,7 @@ class GatedDeltaNet(nn.Module):
         conv_states: torch.Tensor | None = None,
         return_state_history: bool = False,
         state_checkpoint_indices: tuple[int, ...] | None = None,
+        return_replay_records: bool = False,
     ):
         """Run a packed ragged batch and return updated per-sequence states."""
         num_sequences = self._validate_inputs(
@@ -176,6 +177,7 @@ class GatedDeltaNet(nn.Module):
             hidden_states.shape[0] == num_sequences
             and recurrent_states is not None
             and conv_states is not None
+            and not return_replay_records
         ):
             result = self._forward_batched_decode(
                 hidden_states,
@@ -198,6 +200,9 @@ class GatedDeltaNet(nn.Module):
         new_recurrent_states = []
         conv_state_histories = []
         recurrent_state_histories = []
+        replay_keys = []
+        replay_deltas = []
+        replay_log_decays = []
         is_capturing = (
             hidden_states.is_cuda
             and torch.cuda.is_available()
@@ -236,6 +241,7 @@ class GatedDeltaNet(nn.Module):
                 recurrent_state=sequence_recurrent_state,
                 return_state_history=return_state_history,
                 checkpoint_indices=state_checkpoint_indices,
+                return_replay_records=return_replay_records,
                 profile_state_history=self.profile_state_history,
             )
             core_output = core.output.to(hidden_states.dtype)
@@ -252,7 +258,11 @@ class GatedDeltaNet(nn.Module):
             outputs.append(local_output)
             new_conv_states.append(core.conv_state.to(hidden_states.dtype))
             new_recurrent_states.append(core.recurrent_state)
-            if return_state_history or state_checkpoint_indices is not None:
+            if (
+                return_state_history
+                or state_checkpoint_indices is not None
+                or return_replay_records
+            ):
                 context = (
                     record_function("gdn.history.layer_pack")
                     if self.profile_state_history
@@ -266,13 +276,38 @@ class GatedDeltaNet(nn.Module):
                     )
                     recurrent_state_histories.append(
                         core.recurrent_state_history.squeeze(0)
+                        if core.recurrent_state_history is not None
+                        else None
                     )
+                    if return_replay_records:
+                        replay_keys.append(
+                            core.replay_records.key.squeeze(0)
+                        )
+                        replay_deltas.append(
+                            core.replay_records.delta.squeeze(0)
+                        )
+                        replay_log_decays.append(
+                            core.replay_records.log_decay.squeeze(0)
+                        )
 
         result = (
             torch.cat(outputs, dim=0),
             torch.cat(new_recurrent_states, dim=0),
             torch.cat(new_conv_states, dim=0),
         )
+        if return_replay_records:
+            recurrent_history = (
+                torch.cat(recurrent_state_histories, dim=0)
+                if recurrent_state_histories[0] is not None
+                else None
+            )
+            return result + (
+                recurrent_history,
+                torch.cat(conv_state_histories, dim=0),
+                torch.cat(replay_keys, dim=0),
+                torch.cat(replay_deltas, dim=0),
+                torch.cat(replay_log_decays, dim=0),
+            )
         if return_state_history or state_checkpoint_indices is not None:
             context = (
                 record_function("gdn.history.layer_cat")

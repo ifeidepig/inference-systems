@@ -187,3 +187,56 @@ def test_hybrid_speculative_transaction_full_rollback():
     transaction.capture_step()
     transaction.rollback()
     assert torch.all(manager.recurrent_states[:, slot] == 3)
+
+
+def test_state_manager_replays_variable_compact_prefixes():
+    manager = HybridStateManager(
+        max_num_seqs=2,
+        num_linear_layers=1,
+        num_value_heads=2,
+        key_head_dim=3,
+        value_head_dim=2,
+        conv_dim=4,
+        conv_kernel_size=4,
+        conv_dtype=torch.bfloat16,
+        device="cpu",
+    )
+    slots = torch.tensor([manager.allocate(), manager.allocate()])
+    torch.manual_seed(23)
+    initial = torch.randn(2, 2, 3, 2)
+    manager.recurrent_states[0, slots] = initial
+    steps = 3
+    keys = torch.randn(2, steps, 2, 3)
+    deltas = torch.randn(2, steps, 2, 2)
+    log_decays = -torch.rand(2, steps, 2)
+    commit_lengths = torch.tensor([1, 3])
+
+    expected = initial.clone()
+    for step in range(steps):
+        updated = (
+            expected
+            * log_decays[:, step].exp().unsqueeze(-1).unsqueeze(-1)
+            + torch.einsum(
+                "bhd,bhv->bhdv",
+                keys[:, step],
+                deltas[:, step],
+            )
+        )
+        expected = torch.where(
+            (commit_lengths > step).view(2, 1, 1, 1),
+            updated,
+            expected,
+        )
+
+    manager.replay_recurrent(
+        slots,
+        keys.flatten(0, 1).unsqueeze(0),
+        deltas.flatten(0, 1).unsqueeze(0),
+        log_decays.flatten(0, 1).unsqueeze(0),
+        commit_lengths,
+        num_steps=steps,
+    )
+    torch.testing.assert_close(
+        manager.recurrent_states[0, slots],
+        expected,
+    )

@@ -57,6 +57,7 @@ def load_cuda_ops() -> None:
             str(csrc / "add_kernel.cu"),
             str(csrc / "fused_add_rmsnorm_kernel.cu"),
             str(csrc / "gdn_decode_kernel.cu"),
+            str(csrc / "gdn_replay_kernel.cu"),
         ],
         extra_cflags=["-O3"],
         extra_cuda_cflags=["-O3", "-lineinfo"],

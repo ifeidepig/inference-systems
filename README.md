@@ -11,6 +11,7 @@ The repository keeps the upstream Git history and MIT license. The work document
 - **Shape-aware Tensor Core GEMM**: FP32 CUDA Core tiling plus FP16/BF16 direct/staged WMMA, an equal-contract cuBLAS baseline, LLM-shape benchmarking, and measured cuBLAS fallback.
 - **Fine-Grained Hybrid Prefix Cache**: decouples the 256-token physical KV page from a 16-token match unit, restores aligned GDN checkpoints, and uses partial-page KV copy-on-write (COW).
 - **Native Qwen3.5 MTP**: draft, parallel verification, per-request accept/reject, and KV/GDN state commit or rollback.
+- **Compact ReplaySSM prototype**: opt-in MTP verify records `(k, delta, log_decay)` instead of full recurrent snapshots, with fused accepted-prefix and conv-window commit kernels.
 - **Serving and scheduling**: continuous batching, chunked prefill, decode-first/SLO-aware scheduling, streaming, cancellation, request metrics, and OpenAI-compatible HTTP endpoints.
 - **CUDA operator path**: custom AOT/JIT PyTorch extensions, CUDA Graph integration, Compute Sanitizer coverage, and reproducible micro/end-to-end benchmarks.
 
@@ -189,6 +190,15 @@ throughput median from 141.90 to 145.96 tok/s. The resulting MTP path still
 trails the matched target-only median by 11.75%, so it remains a measured
 negative result rather than a general speedup claim. See
 [docs/mtp-phase-profiling.md](docs/mtp-phase-profiling.md).
+
+A further default-off compact ReplaySSM prototype removes recurrent snapshots
+entirely and retains FP32 `(normalized key, delta, log_decay)` records plus the
+small conv history. On the same 0.8B batch-2 geometry, the fixed speculative
+state buffer falls from 37.27 MiB to 3.66 MiB (10.18x), while five-run
+throughput is effectively flat at -0.66%. This is a memory/concurrency result,
+not a speedup claim. It is the compact fold-every-commit stage, not the full
+output-only periodic-flush ReplaySSM kernel. See
+[docs/replayssm-study.md](docs/replayssm-study.md).
 
 ### Scheduler and Serving
 

@@ -151,6 +151,7 @@ class Qwen3_5DecoderLayer(nn.Module):
         conv_state: torch.Tensor | None = None,
         return_state_history: bool = False,
         state_checkpoint_indices: tuple[int, ...] | None = None,
+        return_replay_records: bool = False,
     ):
         if residual is None:
             hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
@@ -165,8 +166,20 @@ class Qwen3_5DecoderLayer(nn.Module):
                 conv_state,
                 return_state_history=return_state_history,
                 state_checkpoint_indices=state_checkpoint_indices,
+                return_replay_records=return_replay_records,
             )
-            if return_state_history or state_checkpoint_indices is not None:
+            if return_replay_records:
+                (
+                    hidden_states,
+                    recurrent_state,
+                    conv_state,
+                    recurrent_history,
+                    conv_history,
+                    replay_key,
+                    replay_delta,
+                    replay_log_decay,
+                ) = linear_result
+            elif return_state_history or state_checkpoint_indices is not None:
                 (
                     hidden_states,
                     recurrent_state,
@@ -174,12 +187,15 @@ class Qwen3_5DecoderLayer(nn.Module):
                     recurrent_history,
                     conv_history,
                 ) = linear_result
+                replay_key = replay_delta = replay_log_decay = None
             else:
                 hidden_states, recurrent_state, conv_state = linear_result
                 recurrent_history = conv_history = None
+                replay_key = replay_delta = replay_log_decay = None
         else:
             hidden_states = self.self_attn(positions, hidden_states)
             recurrent_history = conv_history = None
+            replay_key = replay_delta = replay_log_decay = None
 
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states,
@@ -193,6 +209,9 @@ class Qwen3_5DecoderLayer(nn.Module):
             conv_state,
             recurrent_history,
             conv_history,
+            replay_key,
+            replay_delta,
+            replay_log_decay,
         )
 
 
@@ -218,6 +237,7 @@ class Qwen3_5Model(nn.Module):
         conv_states: list[torch.Tensor | None] | None = None,
         return_state_history: bool = False,
         state_checkpoint_indices: tuple[int, ...] | None = None,
+        return_replay_records: bool = False,
     ):
         num_layers = len(self.layers)
         if recurrent_states is None:
@@ -233,6 +253,9 @@ class Qwen3_5Model(nn.Module):
         new_conv_states: list[torch.Tensor | None] = []
         recurrent_histories: list[torch.Tensor | None] = []
         conv_histories: list[torch.Tensor | None] = []
+        replay_keys: list[torch.Tensor | None] = []
+        replay_deltas: list[torch.Tensor | None] = []
+        replay_log_decays: list[torch.Tensor | None] = []
         for index, layer in enumerate(self.layers):
             (
                 hidden_states,
@@ -241,6 +264,9 @@ class Qwen3_5Model(nn.Module):
                 conv_state,
                 recurrent_history,
                 conv_history,
+                replay_key,
+                replay_delta,
+                replay_log_decay,
             ) = layer(
                 positions,
                 hidden_states,
@@ -250,13 +276,25 @@ class Qwen3_5Model(nn.Module):
                 conv_states[index],
                 return_state_history=return_state_history,
                 state_checkpoint_indices=state_checkpoint_indices,
+                return_replay_records=return_replay_records,
             )
             new_recurrent_states.append(recurrent_state)
             new_conv_states.append(conv_state)
             recurrent_histories.append(recurrent_history)
             conv_histories.append(conv_history)
+            replay_keys.append(replay_key)
+            replay_deltas.append(replay_delta)
+            replay_log_decays.append(replay_log_decay)
         hidden_states, _ = self.norm(hidden_states, residual)
         result = hidden_states, new_recurrent_states, new_conv_states
+        if return_replay_records:
+            return result + (
+                recurrent_histories,
+                conv_histories,
+                replay_keys,
+                replay_deltas,
+                replay_log_decays,
+            )
         if return_state_history or state_checkpoint_indices is not None:
             return result + (recurrent_histories, conv_histories)
         return result
@@ -295,6 +333,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         conv_states: list[torch.Tensor | None] | None = None,
         return_state_history: bool = False,
         state_checkpoint_indices: tuple[int, ...] | None = None,
+        return_replay_records: bool = False,
     ):
         return self.model(
             input_ids,
@@ -304,6 +343,7 @@ class Qwen3_5ForCausalLM(nn.Module):
             conv_states,
             return_state_history,
             state_checkpoint_indices,
+            return_replay_records,
         )
 
     def compute_logits(self, hidden_states_or_tuple) -> torch.Tensor:

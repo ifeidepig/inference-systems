@@ -1,0 +1,134 @@
+{
+  "date": "2026-10-07",
+  "baseline_commit": "b56aca9",
+  "candidate": "compact_replayssm_fold_every_commit",
+  "scope": "Compact speculative recurrent replay; not the output-only periodic-flush ReplaySSM verify kernel.",
+  "environment": {
+    "gpu": "NVIDIA GeForce RTX 3060 Laptop GPU",
+    "model": "Qwen3.5-0.8B-Base",
+    "dtype": "BF16",
+    "batch_size": 2,
+    "output_tokens_per_request": 32,
+    "num_speculative_tokens": 2,
+    "cuda_graph": true,
+    "gdn_decode_backend": "cuda",
+    "fresh_engines_per_arm": 5,
+    "order": "alternating"
+  },
+  "end_to_end": {
+    "minimal_snapshot": {
+      "throughput_tok_s": [
+        151.04127774260513,
+        153.65239337650888,
+        151.4868334473838,
+        147.50180819914453,
+        148.00377183953415
+      ],
+      "throughput_median_tok_s": 151.04127774260513,
+      "mean_tpot_ms": [
+        10.546299516129032,
+        10.329884806451615,
+        10.408672354838709,
+        10.86729164516129,
+        10.854660838709675
+      ],
+      "mean_tpot_median_ms": 10.546299516129032,
+      "peak_allocated_gib_median": 1.7160310745239258
+    },
+    "compact_replay": {
+      "throughput_tok_s": [
+        150.97946037720317,
+        149.49820378906085,
+        152.36075551168733,
+        149.66374018588067,
+        150.04903391427666
+      ],
+      "throughput_median_tok_s": 150.04903391427666,
+      "mean_tpot_ms": [
+        10.587253548387096,
+        10.688463677419355,
+        10.448855806451613,
+        10.657747032258063,
+        10.656937870967742
+      ],
+      "mean_tpot_median_ms": 10.656937870967742,
+      "peak_allocated_gib_median": 1.6819777488708496
+    },
+    "throughput_change_percent": -0.6569355365355078,
+    "tpot_change_percent": 1.0490727545666934,
+    "peak_allocated_change_mib": -34.87,
+    "tokens_exact": true
+  },
+  "phase_profile": {
+    "minimal_verify_forward_ms": [
+      15.263744354248047,
+      13.843456268310547,
+      14.05951976776123,
+      13.846528053283691,
+      14.478336334228516
+    ],
+    "compact_replay_verify_forward_ms": [
+      13.204480171203613,
+      13.071359634399414,
+      14.367744445800781,
+      13.097984313964844,
+      13.198335647583008
+    ],
+    "minimal_verify_median_ms": 14.05951976776123,
+    "compact_replay_verify_median_ms": 13.198335647583008,
+    "verify_change_percent": -6.12,
+    "minimal_commit_ms": [
+      0.18227200210094452,
+      0.19353599846363068,
+      0.18329599499702454,
+      0.18636800348758698,
+      0.18432000279426575
+    ],
+    "compact_replay_commit_ms": [
+      0.4055039994418621,
+      0.40038399770855904,
+      0.42496000975370407,
+      0.4280319958925247,
+      0.40243201330304146
+    ],
+    "minimal_runner_wall_ms": [
+      34.42699700099183,
+      32.032351999077946,
+      32.3542690002796,
+      32.08710999933828,
+      32.94697399905999
+    ],
+    "compact_replay_runner_wall_ms": [
+      32.52420399985567,
+      31.59917299853987,
+      34.55348600073194,
+      32.61325400126225,
+      33.3343349993811
+    ]
+  },
+  "memory": {
+    "minimal_snapshot_graph_bytes": 39075840,
+    "compact_replay_conv_history_bytes": 2654208,
+    "compact_replay_record_bytes": 1184256,
+    "compact_replay_total_graph_bytes": 3838464,
+    "savings_vs_minimal_bytes": 35237376,
+    "reduction_percent": 90.18,
+    "reduction_factor": 10.18
+  },
+  "correctness": {
+    "focused_tests_passed": 27,
+    "compute_sanitizer_memcheck_errors": 0,
+    "eager_cuda_graph": true,
+    "widths": [1, 2, 4],
+    "immediate_reject": true,
+    "mixed_accept_lengths": true,
+    "official_128_token_stream_matches_target": true
+  },
+  "long_stream": {
+    "output_tokens_per_request": 128,
+    "target_throughput_tok_s": 197.93002629130626,
+    "compact_replay_mtp_throughput_tok_s": 192.6418956069759,
+    "acceptance_rate": 0.5465116279069767,
+    "tokens_match": true
+  }
+}
