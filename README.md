@@ -172,13 +172,22 @@ See [docs/fine-grained-hybrid-prefix-cache-report.md](docs/fine-grained-hybrid-p
 
 ### Native MTP
 
-The implementation is correctness-complete for the tested greedy path, including variable acceptance and recurrent-state transactions. In the latest 20-run 0.8B controlled workload, MTP-2 throughput remained 18.2% below the fused target-only path at a 65.9% acceptance rate. This negative result is retained rather than presented as a speedup.
+The implementation is correctness-complete for the tested greedy path,
+including variable acceptance and recurrent-state transactions. Two measured
+follow-up optimizations remove the unused final-alignment vocabulary projection
+and keep the final verify GDN boundary in the active slot. Parallel verify now
+captures only the preceding `K-1` rollback snapshots instead of all `K`
+boundaries.
 
 Phase-level profiling now attributes the measured negative result: parallel
 verify is the largest GPU phase, followed by target decode and three MTP steps
-(two drafts plus final shifted-KV alignment). The correctness-first state
-history is a significant memory consumer but is not the first latency
-bottleneck at batch 2, so ReplaySSM is not recommended yet. See
+(two drafts plus final shifted-KV alignment). On the official 0.8B MTP-2,
+batch-2 CUDA-Graph workload, minimal rollback history halves both logical
+history traffic and the persistent verify-graph history buffer, reduces the
+five-run verify-forward GPU median from 15.79 to 13.98 ms, and improves MTP
+throughput median from 141.90 to 145.96 tok/s. The resulting MTP path still
+trails the matched target-only median by 11.75%, so it remains a measured
+negative result rather than a general speedup claim. See
 [docs/mtp-phase-profiling.md](docs/mtp-phase-profiling.md).
 
 ### Scheduler and Serving

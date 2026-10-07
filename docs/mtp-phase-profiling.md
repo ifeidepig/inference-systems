@@ -290,6 +290,63 @@ also covers mixed boundaries in one batch: one request reuses the active final
 state while one request restores an earlier history row. Eager and CUDA Graph
 outputs remain identical to target-only greedy decoding.
 
+## Implemented follow-up: minimal rollback snapshot
+
+Selective rollback removed the final-boundary select/scatter, but the verifier
+still cloned and stored every boundary, including the state already resident in
+the active slot. The next change replaces dense history with fixed sparse
+checkpoint indices:
+
+```text
+MTP width K
+rollback snapshots = H0 ... H(K-2)
+active final state = H(K-1)
+```
+
+For MTP-2, only `H0` is captured. Accepted length zero restores `H0`; accepted
+length one or two keeps active `H1`. For K=1 no rollback history is needed.
+The same rule generalizes to K=4 as three rollback snapshots plus one active
+final boundary. Eager verification uses `state_checkpoint_indices`, while the
+CUDA Graph owns a fixed `batch x (K-1)` history buffer. This removes the final
+state clone/stack and graph-buffer copy rather than merely ignoring it later.
+
+Focused correctness coverage now includes:
+
+- K=1/2/4 eager and CUDA Graph parity against target-only greedy;
+- forced immediate rejection under parallel eager and graph verification;
+- two requests with different accepted lengths in one batch;
+- sparse recurrent/conv checkpoints against full history and independent
+  prefix scans.
+
+Official 0.8B BF16, RTX 3060, batch 2, MTP-2, 32 output tokens/request,
+CUDA Graph and fused CUDA GDN. Five fresh profiling engines per implementation:
+
+| Metric | Dense K-boundary history | Minimal K-1 history | Change |
+| --- | ---: | ---: | ---: |
+| Verify-forward GPU median | 15.79 ms | 13.98 ms | -11.4% |
+| Profiled ModelRunner wall median | 34.83 ms | 33.13 ms | -4.9% |
+| History bytes over 11 rounds | 820 MiB | 410 MiB | -50% |
+| Persistent verify history buffer | 74.53 MiB | 37.27 MiB | -50% |
+| Peak allocated median | 1.751 GiB | 1.716 GiB | about -36 MiB |
+
+Profiling-off five-engine MTP A/B:
+
+| Metric | Dense history | Minimal history | Change |
+| --- | ---: | ---: | ---: |
+| Throughput median | 141.90 tok/s | 145.96 tok/s | +2.86% |
+| Throughput IQR | 137.97-143.45 | 144.80-146.63 | — |
+| Mean TPOT median | 11.24 ms | 10.98 ms | -2.31% |
+| Peak allocated median | 1.751 GiB | 1.722 GiB | about -30 MiB |
+
+The matched target-only median in the minimal-history run was 165.39 tok/s,
+so MTP remains 11.75% slower despite the improvement. All five MTP streams
+matched target-only greedy. Separate official-model K=1 and K=4 CUDA-Graph
+smokes also matched target-only tokens.
+
+This optimization removes one snapshot per request, not a constant fraction:
+MTP-2 history falls by 50%, MTP-4 by 25%, and MTP-8 by 12.5%. Its absolute
+saving still scales with batch size, number of GDN layers and state size.
+
 ## Tool boundary
 
 Nsight Compute returned:

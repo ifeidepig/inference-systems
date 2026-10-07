@@ -2,6 +2,11 @@
 
 Date: 2026-09-27
 
+> Historical first integration gate. The correctness results remain useful,
+> but the MTP performance section predates final-alignment LM-head removal,
+> selective rollback, and minimal `K-1` rollback-history capture. Current MTP
+> performance evidence is maintained in `docs/mtp-phase-profiling.md`.
+
 This is a same-architecture stepping-stone validation for the Qwen3.5-9B
 project. It is not a substitute for the final 9B cloud gate.
 
@@ -130,6 +135,7 @@ for exact variable-boundary commit. On short requests the remaining launch and
 metadata costs are visible; on the longer run it approaches parity but does not
 yet establish an acceleration.
 
-The next performance work should profile and fuse state-history capture. The
-final project claim still requires
+Follow-up work has since profiled the path and removed the redundant final
+history boundary; the remaining complete performance record is in
+`docs/mtp-phase-profiling.md`. The final project claim still requires
 the official 9B cloud golden, multi-GPU NCCL validation, and 9B benchmark.

@@ -456,12 +456,42 @@ def test_model_runner_mtp_matches_target_with_acceptance_and_rejection(tmp_path)
         make_config(2, parallel_verify=True, cuda_graph=True),
         num_tokens=8,
     )
+    parallel_rejected, _ = _generate_tiny_greedy(
+        make_config(2, parallel_verify=True),
+        num_tokens=8,
+        zero_mtp=True,
+    )
+    graphed_rejected, _ = _generate_tiny_greedy(
+        make_config(2, parallel_verify=True, cuda_graph=True),
+        num_tokens=8,
+        zero_mtp=True,
+    )
+    parallel_k1, _ = _generate_tiny_greedy(
+        make_config(1, parallel_verify=True), num_tokens=8
+    )
+    graphed_k1, _ = _generate_tiny_greedy(
+        make_config(1, parallel_verify=True, cuda_graph=True),
+        num_tokens=8,
+    )
+    parallel_k4, _ = _generate_tiny_greedy(
+        make_config(4, parallel_verify=True), num_tokens=8
+    )
+    graphed_k4, _ = _generate_tiny_greedy(
+        make_config(4, parallel_verify=True, cuda_graph=True),
+        num_tokens=8,
+    )
 
     assert speculative == expected
     assert rejected == expected
     assert chunked == expected
     assert parallel == expected
     assert graphed == expected
+    assert parallel_rejected == expected
+    assert graphed_rejected == expected
+    assert parallel_k1 == expected
+    assert graphed_k1 == expected
+    assert parallel_k4 == expected
+    assert graphed_k4 == expected
     assert normal_rounds
     assert rejection_rounds
     assert all(len(tokens) >= 2 for tokens in rejection_rounds)
@@ -559,6 +589,16 @@ def test_model_runner_mtp_continuous_batch_commits_variable_acceptance(tmp_path)
         phase_profile = runner.get_metrics()["mtp_phase_profile"]
         assert phase_profile["counters"]["state_active_reuse_rows"] == 1
         assert phase_profile["counters"]["state_rollback_rows"] == 1
+        state_bytes = runner.state_manager.bytes_per_slot()
+        assert phase_profile["counters"][
+            "state_history_materialized_bytes"
+        ] == state_bytes * 2
+        assert phase_profile["counters"][
+            "state_history_dense_equivalent_bytes"
+        ] == state_bytes * 2 * 2
+        assert phase_profile["counters"][
+            "state_history_final_boundary_avoided_bytes"
+        ] == state_bytes * 2
         assert phase_profile["counters"][
             "final_alignment_lm_head_skipped"
         ] == 2

@@ -804,15 +804,18 @@ class ModelRunner:
         num_layers = len(self.model.model.layers)
         recurrent_histories = [None] * num_layers
         conv_histories = [None] * num_layers
-        for compact_index, layer_index in enumerate(
-            self.model.model.linear_attention_layer_indices
-        ):
-            recurrent_histories[layer_index] = variables[
-                "recurrent_history"
-            ][compact_index, :num_tokens]
-            conv_histories[layer_index] = variables["conv_history"][
-                compact_index, :num_tokens
-            ]
+        history_steps = variables["history_steps"]
+        if history_steps:
+            num_history_tokens = batch_size * history_steps
+            for compact_index, layer_index in enumerate(
+                self.model.model.linear_attention_layer_indices
+            ):
+                recurrent_histories[layer_index] = variables[
+                    "recurrent_history"
+                ][compact_index, :num_history_tokens]
+                conv_histories[layer_index] = variables["conv_history"][
+                    compact_index, :num_history_tokens
+                ]
         self.speculative_verify_cudagraph_replays += 1
         return hidden_states, logits, recurrent_histories, conv_histories
 
@@ -1287,6 +1290,13 @@ class ModelRunner:
         proposal_tokens = torch.stack(proposals, dim=1)
 
         if self.speculative_parallel_verify:
+            rollback_history_steps = max(
+                self.num_speculative_tokens - 1,
+                0,
+            )
+            rollback_checkpoint_indices = tuple(
+                range(rollback_history_steps)
+            )
             with self.mtp_phase_profiler.phase("mtp.verify_prepare"):
                 verify_rows = [
                     torch.cat(
@@ -1317,17 +1327,31 @@ class ModelRunner:
                         batch_size,
                     )
                 else:
-                    (
-                        all_hidden,
-                        all_logits,
-                        recurrent_histories,
-                        conv_histories,
-                    ) = self._forward_target_eager(
-                        verify_ids,
-                        verify_positions,
-                        all_logits=True,
-                        return_state_history=True,
-                    )
+                    if rollback_history_steps:
+                        (
+                            all_hidden,
+                            all_logits,
+                            recurrent_histories,
+                            conv_histories,
+                        ) = self._forward_target_eager(
+                            verify_ids,
+                            verify_positions,
+                            all_logits=True,
+                            state_checkpoint_indices=(
+                                rollback_checkpoint_indices
+                            ),
+                        )
+                    else:
+                        all_hidden, all_logits = (
+                            self._forward_target_eager(
+                                verify_ids,
+                                verify_positions,
+                                all_logits=True,
+                            )
+                        )
+                        num_layers = len(self.model.model.layers)
+                        recurrent_histories = [None] * num_layers
+                        conv_histories = [None] * num_layers
             with self.mtp_phase_profiler.phase("mtp.verify_argmax"):
                 target_tokens = self._distributed_greedy_matrix(
                     all_logits,
@@ -1413,7 +1437,7 @@ class ModelRunner:
                 if rollback_count:
                     history_indices = (
                         rollback_rows
-                        * self.num_speculative_tokens
+                        * rollback_history_steps
                         + state_boundaries.index_select(
                             0, rollback_rows
                         ).to(torch.long)
@@ -1452,6 +1476,19 @@ class ModelRunner:
             )
             self.mtp_phase_profiler.add_counter(
                 "state_history_materialized_bytes", history_bytes
+            )
+            dense_history_bytes = (
+                self.state_manager.bytes_per_slot()
+                * batch_size
+                * self.num_speculative_tokens
+            )
+            self.mtp_phase_profiler.add_counter(
+                "state_history_dense_equivalent_bytes",
+                dense_history_bytes,
+            )
+            self.mtp_phase_profiler.add_counter(
+                "state_history_final_boundary_avoided_bytes",
+                dense_history_bytes - history_bytes,
             )
             self.mtp_phase_profiler.add_counter(
                 "selected_state_bytes", selected_state_bytes
@@ -1555,6 +1592,19 @@ class ModelRunner:
             self.mtp_phase_profiler.set_counter(
                 "verify_graph_history_capacity_bytes",
                 graph_history_bytes,
+            )
+            dense_graph_history_bytes = (
+                self.state_manager.bytes_per_slot()
+                * max(self.graph_bs)
+                * self.num_speculative_tokens
+            )
+            self.mtp_phase_profiler.set_counter(
+                "verify_graph_dense_history_capacity_bytes",
+                dense_graph_history_bytes,
+            )
+            self.mtp_phase_profiler.set_counter(
+                "verify_graph_history_capacity_saved_bytes",
+                dense_graph_history_bytes - graph_history_bytes,
             )
         self.mtp_phase_profiler.flush()
         reset_context()
@@ -1749,7 +1799,10 @@ class ModelRunner:
         """Capture fixed-width parallel target verification buckets."""
         max_bs = max(self.graph_bs)
         steps = self.num_speculative_tokens
+        history_steps = max(steps - 1, 0)
+        rollback_checkpoint_indices = tuple(range(history_steps))
         max_tokens = max_bs * steps
+        max_history_tokens = max_bs * history_steps
         max_num_blocks = (
             self.config.max_model_len + self.block_size - 1
         ) // self.block_size
@@ -1784,7 +1837,7 @@ class ModelRunner:
         )
         recurrent_history = torch.zeros(
             self.state_manager.num_linear_layers,
-            max_tokens,
+            max_history_tokens,
             reference_layer.num_value_heads,
             reference_layer.key_head_dim,
             reference_layer.value_head_dim,
@@ -1792,7 +1845,7 @@ class ModelRunner:
         )
         conv_history = torch.zeros(
             self.state_manager.num_linear_layers,
-            max_tokens,
+            max_history_tokens,
             reference_layer.conv_dim,
             reference_layer.conv_kernel_size - 1,
             dtype=hf_config.dtype,
@@ -1808,12 +1861,14 @@ class ModelRunner:
             "outputs": outputs,
             "recurrent_history": recurrent_history,
             "conv_history": conv_history,
+            "history_steps": history_steps,
         }
         self.verify_graphs = {}
         num_layers = len(self.model.model.layers)
         linear_indices = self.model.model.linear_attention_layer_indices
         for batch_size in reversed(self.graph_bs):
             num_tokens = batch_size * steps
+            num_history_tokens = batch_size * history_steps
             cu_q = cu_seqlens_q[: batch_size + 1]
             cu_k = cu_seqlens_k[: batch_size + 1]
             slots = state_slot_ids[:batch_size]
@@ -1834,20 +1889,35 @@ class ModelRunner:
                     num_total_layers=num_layers,
                     linear_layer_indices=linear_indices,
                 )
-                (
-                    hidden_states,
-                    new_recurrent_states,
-                    new_conv_states,
-                    recurrent_histories,
-                    conv_histories,
-                ) = self.model(
-                    input_ids[:num_tokens],
-                    positions[:num_tokens],
-                    cu_q,
-                    recurrent_states,
-                    conv_states,
-                    return_state_history=True,
-                )
+                if history_steps:
+                    (
+                        hidden_states,
+                        new_recurrent_states,
+                        new_conv_states,
+                        recurrent_histories,
+                        conv_histories,
+                    ) = self.model(
+                        input_ids[:num_tokens],
+                        positions[:num_tokens],
+                        cu_q,
+                        recurrent_states,
+                        conv_states,
+                        state_checkpoint_indices=(
+                            rollback_checkpoint_indices
+                        ),
+                    )
+                else:
+                    (
+                        hidden_states,
+                        new_recurrent_states,
+                        new_conv_states,
+                    ) = self.model(
+                        input_ids[:num_tokens],
+                        positions[:num_tokens],
+                        cu_q,
+                        recurrent_states,
+                        conv_states,
+                    )
                 outputs[:num_tokens] = hidden_states
                 self.state_manager.scatter(
                     slots,
@@ -1855,13 +1925,16 @@ class ModelRunner:
                     new_conv_states,
                     linear_layer_indices=linear_indices,
                 )
-                for compact_index, layer_index in enumerate(linear_indices):
-                    recurrent_history[
-                        compact_index, :num_tokens
-                    ] = recurrent_histories[layer_index]
-                    conv_history[
-                        compact_index, :num_tokens
-                    ] = conv_histories[layer_index]
+                if history_steps:
+                    for compact_index, layer_index in enumerate(
+                        linear_indices
+                    ):
+                        recurrent_history[
+                            compact_index, :num_history_tokens
+                        ] = recurrent_histories[layer_index]
+                        conv_history[
+                            compact_index, :num_history_tokens
+                        ] = conv_histories[layer_index]
 
             step()
             self.state_manager.reset_scratch()
