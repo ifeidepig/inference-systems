@@ -196,3 +196,19 @@ Before implementing the full output-only circular kernel:
 6. validate floating-point drift because chunked/tensor-core reconstruction is
    mathematically equivalent but not bit-exact.
 
+## Final sweep and feature freeze
+
+The final batch/concurrency sweep is recorded in
+`docs/replayssm-final-sweep.md`. Batch 1/2/4 showed throughput changes of
+`+2.18%/+2.08%/+4.63%`, while batch 8 reversed to `-4.03%`. Peak-memory savings
+grew from about 16 MiB at batch 1 to 134 MiB at batch 8.
+
+Exact-token comparison also exposed batch-dependent branches: Minimal and
+Replay differed at batch 1/4/8; target-only diagnostics showed Replay matching
+target at batch 1/2/4, while neither MTP path matched it at batch 8 for this
+prompt set. The result is therefore a floating-point/token-parity boundary for
+the complete MTP stack, not proof that either commit scheme is globally more
+accurate.
+
+ReplaySSM is now feature-frozen. The full output-only periodic-flush kernel will
+not be implemented in this project phase.

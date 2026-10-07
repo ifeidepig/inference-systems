@@ -200,6 +200,12 @@ not a speedup claim. It is the compact fold-every-commit stage, not the full
 output-only periodic-flush ReplaySSM kernel. See
 [docs/replayssm-study.md](docs/replayssm-study.md).
 
+The final batch 1/2/4/8 sweep found monotonic peak-memory savings but
+workload-dependent throughput (`+2.18%/+2.08%/+4.63%/-4.03%`) and
+batch-dependent token branches. ReplaySSM is therefore feature-frozen and
+remains default-off. See
+[docs/replayssm-final-sweep.md](docs/replayssm-final-sweep.md).
+
 ### Scheduler and Serving
 
 The SLO-aware scheduler improved the measured token-SLO violation rate from 29.17% to 16.67% on the recorded Qwen3-0.6B Poisson workload, with a 0.53% throughput reduction. The burst workload remained a negative case. Workload definitions and evidence boundaries are in [docs/slo-scheduler.md](docs/slo-scheduler.md) and [docs/online-workload.md](docs/online-workload.md).

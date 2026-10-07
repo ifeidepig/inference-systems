@@ -105,16 +105,21 @@ def summarize_phase_profiles(runs: list[dict], owner: str) -> dict:
     }
 
 
-def run_once(args, num_speculative_tokens: int) -> dict:
+def run_once(
+    args,
+    num_speculative_tokens: int,
+    prompts: list[list[int]] | None = None,
+) -> dict:
+    prompts = DEFAULT_PROMPTS if prompts is None else prompts
     engine = LLM(
         args.model,
         max_num_batched_tokens=args.max_num_batched_tokens,
-        max_num_seqs=len(DEFAULT_PROMPTS),
+        max_num_seqs=len(prompts),
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
         enforce_eager=args.enforce_eager,
         max_num_kvcache_blocks=args.max_num_kvcache_blocks,
-        max_num_state_slots=len(DEFAULT_PROMPTS),
+        max_num_state_slots=len(prompts),
         num_speculative_tokens=num_speculative_tokens,
         speculative_parallel_verify=args.parallel_verify,
         gdn_decode_backend=args.gdn_decode_backend,
@@ -129,7 +134,7 @@ def run_once(args, num_speculative_tokens: int) -> dict:
     try:
         if args.warmup:
             engine.generate(
-                DEFAULT_PROMPTS,
+                prompts,
                 SamplingParams(
                     temperature=0.0,
                     max_tokens=min(4, args.output_tokens),
@@ -143,14 +148,14 @@ def run_once(args, num_speculative_tokens: int) -> dict:
         torch.cuda.nvtx.range_push("benchmark.measured")
         try:
             outputs = engine.generate(
-                DEFAULT_PROMPTS,
+                prompts,
                 sampling,
                 use_tqdm=False,
             )
         finally:
             torch.cuda.nvtx.range_pop()
         elapsed = perf_counter() - started
-        request_metrics = engine.get_request_metrics()[-len(DEFAULT_PROMPTS) :]
+        request_metrics = engine.get_request_metrics()[-len(prompts) :]
         tpot_values = [
             item["tpot_ms"]
             for item in request_metrics

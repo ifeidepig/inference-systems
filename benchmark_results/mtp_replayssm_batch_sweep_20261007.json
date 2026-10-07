@@ -1,0 +1,154 @@
+{
+  "date": "2026-10-07",
+  "commit": "0714cf2",
+  "config": {
+    "gpu": "NVIDIA GeForce RTX 3060 Laptop GPU",
+    "model": "Qwen3.5-0.8B-Base",
+    "dtype": "BF16",
+    "batch_sizes": [1, 2, 4, 8],
+    "repetitions": 5,
+    "order": "alternating",
+    "output_tokens_per_request": 32,
+    "num_speculative_tokens": 2,
+    "cuda_graph": true,
+    "gdn_decode_backend": "cuda"
+  },
+  "points": [
+    {
+      "batch_size": 1,
+      "minimal_snapshot": {
+        "throughput_tok_s_median": 92.25662684529091,
+        "throughput_iqr": [92.2336752264335, 92.40218633691724],
+        "tpot_ms_median": 9.220799741935485,
+        "ttft_ms_median": 60.707753,
+        "peak_allocated_gib": 1.7359704971313477
+      },
+      "compact_replay": {
+        "throughput_tok_s_median": 94.26710839097626,
+        "throughput_iqr": [94.1290721133726, 94.41857488599463],
+        "tpot_ms_median": 9.023019612903225,
+        "ttft_ms_median": 59.525816,
+        "peak_allocated_gib": 1.7202792167663574
+      },
+      "change_percent": {
+        "throughput": 2.179227242999904,
+        "tpot": -2.1449346539082925,
+        "ttft": -1.946929249712137,
+        "peak_allocated": -0.9038909584534793
+      },
+      "paired_tokens_exact": false,
+      "target_parity_diagnostic": {
+        "minimal_snapshot": false,
+        "compact_replay": true,
+        "first_paired_mismatch": {
+          "request": 0,
+          "token_index": 8,
+          "minimal_token": 57308,
+          "replay_token": 11957
+        }
+      }
+    },
+    {
+      "batch_size": 2,
+      "minimal_snapshot": {
+        "throughput_tok_s_median": 143.8949747631753,
+        "throughput_iqr": [141.08081665398944, 144.44914428295604],
+        "tpot_ms_median": 10.960068048387097,
+        "ttft_ms_median": 91.45479900000001,
+        "peak_allocated_gib": 1.8098344802856445
+      },
+      "compact_replay": {
+        "throughput_tok_s_median": 146.8923525054934,
+        "throughput_iqr": [145.4981882977232, 148.48091691091184],
+        "tpot_ms_median": 10.686467048387097,
+        "ttft_ms_median": 91.86934049999999,
+        "peak_allocated_gib": 1.7756590843200684
+      },
+      "change_percent": {
+        "throughput": 2.0830315632990093,
+        "tpot": -2.4963439897643935,
+        "ttft": 0.453274737392384,
+        "peak_allocated": -1.8883161050275876
+      },
+      "paired_tokens_exact": true,
+      "target_parity_diagnostic": {
+        "minimal_snapshot": true,
+        "compact_replay": true
+      }
+    },
+    {
+      "batch_size": 4,
+      "minimal_snapshot": {
+        "throughput_tok_s_median": 200.72703835060804,
+        "throughput_iqr": [194.63871846869077, 205.2646008235207],
+        "tpot_ms_median": 14.915834838709678,
+        "ttft_ms_median": 162.806501,
+        "peak_allocated_gib": 1.9566645622253418
+      },
+      "compact_replay": {
+        "throughput_tok_s_median": 210.01898419061948,
+        "throughput_iqr": [203.87346912921018, 219.775199743309],
+        "tpot_ms_median": 13.618469612903226,
+        "ttft_ms_median": 163.40323625,
+        "peak_allocated_gib": 1.8927388191223145
+      },
+      "change_percent": {
+        "throughput": 4.629145089951092,
+        "tpot": -8.69790554692601,
+        "ttft": 0.3665303574087675,
+        "peak_allocated": -3.267077266954932
+      },
+      "paired_tokens_exact": false,
+      "target_parity_diagnostic": {
+        "minimal_snapshot": false,
+        "compact_replay": true,
+        "first_paired_mismatch": {
+          "request": 0,
+          "token_index": 8,
+          "minimal_token": 57308,
+          "replay_token": 11957
+        }
+      }
+    },
+    {
+      "batch_size": 8,
+      "minimal_snapshot": {
+        "throughput_tok_s_median": 274.1141144444876,
+        "throughput_iqr": [271.8011867240315, 275.8052043516848],
+        "tpot_ms_median": 20.193046354838707,
+        "ttft_ms_median": 287.8672485,
+        "peak_allocated_gib": 2.2516255378723145
+      },
+      "compact_replay": {
+        "throughput_tok_s_median": 263.0719774518643,
+        "throughput_iqr": [260.0228343318534, 268.65002388070343],
+        "tpot_ms_median": 19.63383441935484,
+        "ttft_ms_median": 289.948225125,
+        "peak_allocated_gib": 2.1203560829162598
+      },
+      "change_percent": {
+        "throughput": -4.028299314320605,
+        "tpot": -2.7693292317425233,
+        "ttft": 0.7228945410926224,
+        "peak_allocated": -5.8299860588763135
+      },
+      "paired_tokens_exact": false,
+      "target_parity_diagnostic": {
+        "minimal_snapshot": false,
+        "compact_replay": false,
+        "first_paired_mismatch": {
+          "request": 7,
+          "token_index": 16,
+          "minimal_token": 58,
+          "replay_token": 8
+        }
+      }
+    }
+  ],
+  "decision": {
+    "status": "feature_freeze",
+    "reason": "Memory savings are monotonic, throughput is workload dependent, and exact-token parity is batch/prompt sensitive in the current BF16 GDN/MTP stack.",
+    "resume_claim": "Do not claim ReplaySSM throughput acceleration or quality-safe parity.",
+    "future_work": "Stopped by user request; no full output-only periodic-flush kernel work."
+  }
+}
