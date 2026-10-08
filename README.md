@@ -77,6 +77,26 @@ cycle 0: Torch -> CUDA
 cycle 1: CUDA -> Torch
 ```
 
+### Resume-facing measured results
+
+The headline numbers below are intentionally paired with their comparison
+boundary. They are not universal production claims.
+
+| Result | Comparison boundary |
+| --- | --- |
+| Hybrid scheduler: TTFT P50 `-67.2%`, request throughput `+41.6%` | Five fresh-engine medians on the controlled KV-pressure Low trace (8 KV pages, no preemption), Full policy versus the same engine with FCFS admission and LIFO preemption |
+| Shared-junction promotion: third-request TTFT `9.95 s -> 0.34 s` | 2048-token hot prefix, second-sighting promotion versus a fixed three-sighting promotion baseline; see `docs/promotion-threshold-study.md` |
+| MTP final alignment `2.37 -> 0.71 ms`; no-rollback state select/scatter `1.07 -> 0.19 ms` | Shape-matched phase profile after removing the unused alignment LM head and avoiding final-boundary state copies |
+| MTP throughput `+6.47%` | Five fresh engines per arm versus the pre-optimization MTP path, not versus target-only; the optimized MTP path still trailed target-only by `12.24%` in that experiment |
+| Fused RMSNorm `76.4 -> 10.7 us` (`7.1x`) | BF16 `H=1024`, `Rows=32` microbenchmark versus the `torch.compile` baseline; model-level A/B remained flat |
+
+The scheduler matrix, prefix promotion study, MTP phase profile, and RMSNorm
+methodology are reported in
+[`docs/serving-benchmark.md`](docs/serving-benchmark.md),
+[`docs/promotion-threshold-study.md`](docs/promotion-threshold-study.md),
+[`docs/mtp-phase-profiling.md`](docs/mtp-phase-profiling.md), and
+[`docs/custom-rmsnorm.md`](docs/custom-rmsnorm.md), respectively.
+
 ### Fused GDN Decode
 
 | Batch | Torch core | CUDA core | Core speedup | Torch layer | CUDA layer | Layer speedup |
